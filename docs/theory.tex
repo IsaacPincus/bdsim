@@ -1,0 +1,2461 @@
+% ---------------------------------------------------------------------------
+%  bdsim -- mathematical and algorithmic reference
+%  Compile with:  pdflatex theory.tex   (twice, for cross-references)
+% ---------------------------------------------------------------------------
+\documentclass[11pt,a4paper]{report}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{gray!50},
+  backgroundcolor=\color{gray!5},
+  columns=fullflexible,
+}
+
+\newcommand{\D}{\bm{D}}
+\newcommand{\B}{\bm{B}}
+\newcommand{\R}{\bm{R}}
+\newcommand{\Q}{\bm{Q}}
+\newcommand{\uv}{\bm{u}}
+\newcommand{\dt}{\Delta t^{*}}
+\newcommand{\kB}{k_\mathrm{B}}
+% Long paths/identifiers in \code should be breakable, otherwise they overrun
+% the margin. Insert discretionary breaks after / and _ inside typewriter text.
+\newcommand{\code}[1]{\texttt{\seqsplitcode{#1}}}
+\newcommand{\seqsplitcode}[1]{#1}
+\setlength{\emergencystretch}{3em}
+\sloppy
+
+\title{\textbf{bdsim}\\[0.4em]
+       \large Mathematical and algorithmic reference for the\\
+       C\texttt{++}/Python Brownian dynamics bead--spring code}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document specifies the mathematics implemented by the \code{bdsim} code: the
+stochastic differential equation that is integrated, the semi-implicit
+predictor--corrector scheme, every spring force law and how its implicit
+per-step equation is solved, the hydrodynamic-interaction machinery (RPY tensor,
+Cholesky and Chebyshev square roots, spectral bounds), the bending and
+excluded-volume potentials, the random number generator, the initial-configuration
+samplers, user-applied external forces, and the measured observables. It also
+covers the inverse problem: how a real semiflexible molecule of given contour and
+persistence length is coarse-grained onto the model, which moments of the
+wormlike-chain distribution that fit should target, and what the resulting chain
+does and does not reproduce --- in particular its force-extension behaviour. The
+dynamics are matched separately, by fixing the bead hydrodynamic radius from a
+measured diffusivity, which also supplies the conversions between simulation and
+laboratory units. A final chapter covers the estimation of error bars from
+correlated time series, without which none of the comparisons mean anything.
+
+It is derived from the appendices of the author's thesis, but has been edited to
+describe \emph{the code as it currently stands}. Where the implementation departs
+from the thesis --- most importantly in the estimation of the spectral bounds used
+by the Chebyshev square root, and in several robustness measures added to the
+implicit spring solve --- the departure is stated explicitly and the reason given.
+Section~\ref{sec:departures} collects these differences in one place.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\chapter{Scope, notation and units}
+\label{ch:scope}
+
+\section{What the code does}
+
+\code{bdsim} integrates the Brownian dynamics of a single bead--spring chain of
+$N$ beads connected by $N-1$ springs, optionally with hydrodynamic interaction
+(HI), excluded volume (EV) and a bending potential, in a homogeneous flow field.
+The core is C\texttt{++}; a Python layer (via \code{nanobind}) owns run
+configuration, initial configurations, sampling, ensemble averaging and
+input/output.
+
+\section{Non-dimensionalisation}
+\label{sec:units}
+
+All quantities are in the standard Hookean non-dimensional form. With spring
+constant $H$, bead friction coefficient $\zeta$ and thermal energy $\kB T$, the
+scales are
+\begin{equation}
+  l_H = \sqrt{\frac{\kB T}{H}}, \qquad
+  \lambda_H = \frac{\zeta}{4H}, \qquad
+  F_H = \sqrt{H \kB T},
+\end{equation}
+for length, time and force respectively. Starred quantities are non-dimensional;
+the star is dropped wherever it is unambiguous. In these units $H = 1$ and
+$\kB T = 1$.
+
+The hydrodynamic interaction parameter is
+\begin{equation}
+  h^{*} = \frac{a}{\sqrt{\pi}\, l_H},
+  \qquad\text{equivalently}\qquad
+  a^{*} = \sqrt{\pi}\, h^{*},
+  \label{eq:hstar}
+\end{equation}
+where $a$ is the bead hydrodynamic radius. Equation~\eqref{eq:hstar} is worth
+stating explicitly because it fixes the crossover radius in the RPY tensor
+(Section~\ref{sec:rpy}): the near-field branch is entered when the bead
+separation falls below $2a^{*} = 2\sqrt{\pi}\,h^{*}$.
+
+\section{Notation}
+
+\begin{longtable}{@{}p{0.30\textwidth}p{0.64\textwidth}@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+\endhead
+$N$ & number of beads \\
+$\bm{r}_\nu$ & position of bead $\nu$, $\nu = 1,\dots,N$ \\
+$\R$ & the $3N$ block vector of all bead positions \\
+$\Q_\mu = \bm{r}_{\mu+1}-\bm{r}_\mu$ & connector (bond) vector $\mu$, $\mu = 1,\dots,N-1$ \\
+$Q_\mu = \|\Q_\mu\|$ & bond length \\
+$\uv_\mu = \Q_\mu/Q_\mu$ & bond unit vector \\
+$\theta_\mu$ & angle between bonds $\mu-1$ and $\mu$ \\
+$\bm{K}$ & velocity-gradient tensor $\bm{\kappa}$, applied blockwise \\
+$\D$ & $3N\times3N$ diffusion (mobility) tensor \\
+$\B$ & a matrix with $\D = \B\cdot\B^{\mathsf{T}}$ \\
+$\bm{F}^{\mathrm{S}}$ & spring force on each bead (treated implicitly) \\
+$\bm{F}^{\mathrm{E}}$ & all non-spring forces: EV $+$ bending (explicit) \\
+$\bm{F}^{\mathrm{c}}_\mu$ & force carried by spring $\mu$ \\
+$\dt$ & timestep \\
+$n$, $j$ & timestep index, implicit-iteration index \\
+\bottomrule
+\end{longtable}
+
+A tilde denotes a predicted (Euler) quantity, e.g.\ $\tilde{\R}_{n+1}$.
+
+\section{Source map}
+
+\begin{longtable}{@{}p{0.34\textwidth}p{0.60\textwidth}@{}}
+\toprule
+File & Contents \\
+\midrule
+\endhead
+\code{src/integrator.cpp} & the predictor--corrector scheme (Chapter~\ref{ch:integrator}) \\
+\code{src/spring.cpp}     & force laws and the implicit connector solve (Chapter~\ref{ch:springs}) \\
+\code{src/numerics.cpp}   & cubic root finder, Newton polish, \code{rtsafe} \\
+\code{src/hydrodynamics.cpp} & RPY tensor, Chebyshev square root, spectral bounds (Chapter~\ref{ch:hi}) \\
+\code{src/mobility.cpp}   & \code{Diffusion}/\code{Mobility}, Brownian displacement, noise \\
+\code{src/linalg.cpp}     & dense mat--vec, Cholesky factorisation \\
+\code{src/bending.cpp}    & bending force (Chapter~\ref{ch:bending}) \\
+\code{src/excluded\_volume.cpp} & EV force (Chapter~\ref{ch:ev}) \\
+\code{src/flow.cpp}       & $\bm{\kappa}(t)$ (Section~\ref{sec:flow}) \\
+\code{src/external\_force.cpp} & user-applied bead forces (Section~\ref{sec:external}) \\
+\code{src/rng.cpp}        & \code{ran\_1} generator (Chapter~\ref{ch:rng}) \\
+\code{python/bdsim/initial.py} & initial configurations (Chapter~\ref{ch:initial}) \\
+\code{python/bdsim/properties.py} & observables (Chapter~\ref{ch:observables}) \\
+\code{python/bdsim/coarse\_grain.py} & wormlike-chain coarse-graining (Chapter~\ref{ch:coarse}) \\
+\code{python/bdsim/dynamics.py} & hydrodynamic radius, $h^{*}$, real and rodlike units (Chapter~\ref{ch:dynamics}) \\
+\code{python/bdsim/statistics.py} & correlated-data error bars (Chapter~\ref{ch:statistics}) \\
+\bottomrule
+\end{longtable}
+
+% ===========================================================================
+\chapter{Governing equations}
+\label{ch:governing}
+
+\section{The stochastic differential equation}
+
+The configurational distribution function obeys a Fokker--Planck equation whose
+It\^{o}-equivalent stochastic differential equation, in the non-dimensional form
+integrated by the code, is
+\begin{equation}
+  \boxed{\;
+  \mathrm{d}\R = \left[\bm{K}\cdot\R + \tfrac{1}{4}\,\D\cdot\bm{F}^{\phi}\right]\mathrm{d}t^{*}
+                 + \tfrac{1}{\sqrt{2}}\,\B\cdot\mathrm{d}\bm{W}\;}
+  \label{eq:sde}
+\end{equation}
+where $\bm{F}^{\phi}$ is the total conservative force on each bead, $\D$ is the
+diffusion tensor, $\B$ satisfies $\D = \B\cdot\B^{\mathsf{T}}$, and
+$\mathrm{d}\bm{W}$ is a Wiener increment of variance $\mathrm{d}t^{*}$.
+
+The total force is split into a spring part and everything else,
+\begin{equation}
+  \bm{F}^{\phi} = \bm{F}^{\mathrm{S}} + \bm{F}^{\mathrm{E}},
+  \qquad
+  \bm{F}^{\mathrm{E}} = \bm{F}^{\mathrm{EV}} + \bm{F}^{\mathrm{b}} + \bm{F}^{\mathrm{ext}}(t),
+\end{equation}
+because the scheme of Chapter~\ref{ch:integrator} treats $\bm{F}^{\mathrm{S}}$
+implicitly and $\bm{F}^{\mathrm{E}}$ explicitly. In the code $\bm{F}^{\mathrm{E}}$
+is assembled by \code{PhysicalModel::non\_spring\_force}, which is the single
+place where a new explicit force type would be added.
+
+\section{Flow field}
+\label{sec:flow}
+
+The flow enters only through the velocity-gradient tensor $\bm{\kappa}$, applied
+to each bead independently:
+\begin{equation}
+  (\bm{K}\cdot\R)_\nu = \bm{\kappa}(t)\cdot\bm{r}_\nu .
+\end{equation}
+The code takes $\bm{\kappa}$ directly as a $3\times3$ tensor rather than
+enumerating named flow types. It is either constant, or supplied as a table of
+samples $(t_i, \bm{\kappa}_i)$ with strictly ascending $t_i$, in which case it is
+interpolated componentwise and linearly,
+\begin{equation}
+  \bm{\kappa}(t) = \bm{\kappa}_i
+    + \frac{t-t_i}{t_{i+1}-t_i}\left(\bm{\kappa}_{i+1}-\bm{\kappa}_i\right),
+    \qquad t_i \le t < t_{i+1},
+\end{equation}
+and clamped to the end samples outside the tabulated range. The usual flows are
+then just particular tensors, supplied by \code{python/bdsim/flows.py}:
+\begin{equation}
+  \text{simple shear:}\;\; \kappa_{xy} = \dot\gamma;
+  \qquad
+  \text{uniaxial extension:}\;\; \bm{\kappa} = \dot\varepsilon\,\mathrm{diag}(1,-\tfrac12,-\tfrac12);
+\end{equation}
+\begin{equation}
+  \text{planar extension:}\;\; \bm{\kappa} = \dot\varepsilon\,\mathrm{diag}(1,-1,0).
+\end{equation}
+Harmonic traps are not implemented.
+
+
+\section{External forces}
+\label{sec:external}
+
+An external force is not part of the chain's own physics: it is whatever the
+experiment applies --- an optical trap, a magnetic bead, a pulling protocol. It is
+therefore kept separate from the conservative intramolecular forces and added to
+the explicit part of the step, exactly like excluded volume or bending, but
+depending on time rather than on configuration.
+
+Each entry applies a force to one bead, either constant or given as a table of
+$(t_i, \bm{F}_i)$ samples that is linearly interpolated and clamped outside the
+tabulated range --- the same convention as the flow tensor, so a pulling protocol
+and a flow protocol are specified in the same way. Negative bead indices count
+from the end of the chain, so $-1$ is the last bead.
+
+The canonical use is a stretching experiment, in which equal and opposite forces
+are applied to the two ends,
+\begin{equation}
+  \bm{F}^{\mathrm{ext}}_{1} = -f\hat{\bm{z}},
+  \qquad
+  \bm{F}^{\mathrm{ext}}_{N} = +f\hat{\bm{z}},
+  \label{eq:stretch}
+\end{equation}
+so that the net force vanishes and the chain is stretched without drifting. This
+is what \code{ExternalForce::add\_stretch} builds.
+
+\paragraph{What the external force is deliberately not part of.} It is excluded
+from \code{PhysicalModel::non\_spring\_force}, and therefore from the
+\code{total\_force} exposed to Python, which continues to mean \emph{the chain's
+own force}. Two things depend on that: the Kramers--Kirkwood stress
+\eqref{eq:kramers}, which is a sum over intramolecular forces and would be wrong
+if an applied load were folded in, and the bit-exact cross-check against the
+Fortran (Section~\ref{sec:fortran-compare}), whose force output has no such term.
+The applied force is inspected separately through \code{external\_force(phys,
+nbeads, t)}.
+
+% ===========================================================================
+\chapter{Time integration: the semi-implicit predictor--corrector}
+\label{ch:integrator}
+
+The scheme follows Prabhakar and Prakash, with the spring force treated
+implicitly so that finitely extensible springs remain stable at moderate
+timesteps. It has three stages per step.
+
+\section{Predictor}
+
+An explicit Euler step gives the predicted positions,
+\begin{equation}
+  \tilde{\R}_{n+1} = \R_n
+    + \left[\bm{K}\cdot\R_n
+            + \tfrac{1}{4}\D_n\cdot\bm{F}^{\mathrm{S}}_n
+            + \tfrac{1}{4}\D_n\cdot\bm{F}^{\mathrm{E}}_n\right]\dt
+    + \tfrac{1}{\sqrt{2}}\,\Delta\bm{S}_n ,
+  \label{eq:predictor}
+\end{equation}
+where
+\begin{equation}
+  \Delta\bm{S}_n = \B_n\cdot\Delta\bm{W}_n
+\end{equation}
+is the Brownian displacement, constructed once per step
+(Section~\ref{sec:brownian-step}) and reused unchanged by the corrector.
+
+\section{Corrector and the \texorpdfstring{$\bm{\Upsilon}$}{Upsilon} term}
+
+The corrector is
+\begin{equation}
+\begin{aligned}
+  \R_{n+1} = \R_n
+    &+ \Big[\tfrac{1}{2}\left\{\bm{K}\cdot\R_n + \bm{K}\cdot\tilde{\R}_{n+1}\right\}
+       + \tfrac{1}{8}\D_n\cdot\left\{\bm{F}^{\mathrm{S}}_n + \bm{F}^{\mathrm{S}}_{n+1}\right\}\\
+    &\phantom{+\Big[}
+       + \tfrac{1}{8}\D_n\cdot\left\{\bm{F}^{\mathrm{E}}_n + \tilde{\bm{F}}^{\mathrm{E}}_{n+1}\right\}\Big]\dt
+       + \tfrac{1}{\sqrt{2}}\,\Delta\bm{S}_n ,
+\end{aligned}
+  \label{eq:corrector}
+\end{equation}
+in which $\tilde{\bm{F}}^{\mathrm{E}}_{n+1}$ is evaluated at the \emph{predicted}
+positions, while $\bm{F}^{\mathrm{S}}_{n+1}$ --- the unknown --- is implicit. Any
+external force is part of $\bm{F}^{\mathrm{E}}$ and, being a function of time
+rather than configuration, is evaluated at $t$ in the predictor and at $t+\dt$ in
+the corrector.
+Note that $\D_n$ is \emph{not} recomputed at the predicted configuration: the
+change over one timestep is negligible and recomputing it was found to make no
+difference to accuracy, while costing a second tensor construction.
+
+Collecting everything on the right-hand side of \eqref{eq:corrector} except the
+implicit term defines
+\begin{equation}
+  \tilde{\bm{\Upsilon}}_{n+1} = \R_n
+    + \left[\tfrac{1}{2}\left\{\bm{K}\cdot\R_n + \bm{K}\cdot\tilde{\R}_{n+1}\right\}
+      + \tfrac{1}{8}\D_n\cdot\bm{F}^{\mathrm{S}}_n
+      + \tfrac{1}{8}\D_n\cdot\left\{\bm{F}^{\mathrm{E}}_n+\tilde{\bm{F}}^{\mathrm{E}}_{n+1}\right\}\right]\dt
+    + \tfrac{1}{\sqrt{2}}\Delta\bm{S}_n .
+  \label{eq:upsilon}
+\end{equation}
+In the code this is the \code{upsilon} stage, returning a field of $N$ vectors.
+
+\section{Implicit solve for the connector vectors}
+
+Introduce the bond-difference operator
+\begin{equation}
+  \mathcal{D}_\mu[\bm{X}] \equiv \bm{X}_{\mu+1} - \bm{X}_{\mu}.
+\end{equation}
+Differencing \eqref{eq:corrector} along the chain and moving the spring term to
+the left gives the fixed-point equation solved each step,
+\begin{equation}
+  \boxed{\;
+  \Q^{(j)}_{\mu,n+1} + \frac{\dt}{4}\,\bm{F}^{\mathrm{c}(j)}_{\mu}
+    = \bm{\Gamma}^{(j-1)}_{\mu,n+1}\;}
+  \label{eq:implicit}
+\end{equation}
+with
+\begin{equation}
+  \bm{\Gamma}^{(j-1)}_{\mu,n+1}
+    = \mathcal{D}_\mu\!\left[\tilde{\bm{\Upsilon}}_{n+1}\right]
+    + \tfrac{1}{8}\,\mathcal{D}_\mu\!\left[\D_n\cdot\bm{F}^{\mathrm{S}(j-1)}_{n+1}\right]\dt
+    + \tfrac{1}{4}\,\bm{F}^{\mathrm{c}(j-1)}_{\mu}\dt .
+  \label{eq:gamma}
+\end{equation}
+Here $j$ is the iteration index; $\D_n$ and $\tilde{\bm{\Upsilon}}_{n+1}$ are
+fixed during the iteration. Because $\bm{F}^{\mathrm{c}}_\mu$ is parallel to
+$\Q_\mu$, equation~\eqref{eq:implicit} implies
+\begin{equation}
+  \hat{\Q}_{\mu} = \hat{\bm{\Gamma}}_{\mu},
+\end{equation}
+i.e.\ \emph{the updated bond is parallel to $\bm{\Gamma}$}, so only its magnitude
+remains to be found. This is the property that reduces the vector equation to a
+scalar one, and it is verified directly by the unit test \code{test\_direction}.
+
+Writing a general force law as
+\begin{equation}
+  \bm{F}^{\mathrm{c}}(\Q) = H\,\Q\,f(Q),
+  \label{eq:general-force-law}
+\end{equation}
+the magnitude equation is
+\begin{equation}
+  \left(1 + \frac{\dt}{4}f(Q)\right) Q = \Gamma,
+  \qquad \Gamma \equiv \|\bm{\Gamma}_\mu\| ,
+  \label{eq:magnitude}
+\end{equation}
+whose solution for each force law is the subject of Chapter~\ref{ch:springs}.
+The bond is then reconstructed as $\Q_\mu = Q\,\bm{\Gamma}_\mu/\Gamma$ and the
+bead positions rebuilt by cumulative summation from the (fixed) first bead
+$\tilde{\bm{r}}_{1,n+1}$.
+
+\section{Convergence criterion and iteration limit}
+
+The iteration terminates when the root-mean-square change in bead positions
+falls below a tolerance,
+\begin{equation}
+  \frac{1}{N}\left\|\R^{(j)}_{n+1} - \R^{(j-1)}_{n+1}\right\|_2
+    < \varepsilon_{\mathrm{tol}},
+  \label{eq:convergence}
+\end{equation}
+where $\|\cdot\|_2$ is the Euclidean norm over all $3N$ components and
+$\varepsilon_{\mathrm{tol}}$ is \code{SimParams::implicit\_loop\_tol}. The
+iteration is additionally capped at $100N$ iterations. There is no universally
+agreed criterion in the literature; \eqref{eq:convergence} is an absolute rather
+than relative measure, which is adequate here because the bead coordinates are
+$O(1)$ in Hookean units.
+
+\section{Reduced-variance Brownian noise}
+\label{sec:noise}
+
+The Wiener increment is not sampled from a true Gaussian. Following \"{O}ttinger,
+each component is drawn as
+\begin{equation}
+  X = \left(Y-\tfrac12\right)\left[c_1\left(Y-\tfrac12\right)^2 + c_2\right],
+  \qquad Y \sim \mathcal{U}[0,1],
+  \label{eq:ottinger-noise}
+\end{equation}
+with
+\begin{equation}
+  c_1 = 14.14855378, \qquad c_2 = 1.21569221 .
+\end{equation}
+This reproduces the correct second and fourth moments, which is sufficient for
+averages obtained from Brownian dynamics, at appreciably lower cost than a
+Gaussian generator. The increment used in \eqref{eq:predictor} is then
+\begin{equation}
+  \Delta\bm{S}_n = \sqrt{\dt}\;\B_n\cdot\bm{X}_0 ,
+\end{equation}
+with $\bm{X}_0$ the field of deviates \eqref{eq:ottinger-noise}.
+
+\section{Stepping, sampling and reproducibility}
+
+The integrator advances a chain over a requested time span and nothing else:
+sampling, property evaluation and output are owned by the Python driver, which
+integrates in segments. The random stream persists across calls, so a segmented
+run is identical to one continuous run --- this is what makes it legitimate to
+write a snapshot every $N_{\mathrm{write}}$ steps without perturbing the
+trajectory. Trajectories in an ensemble are seeded by index, so ensemble results
+do not depend on how the work is distributed over workers.
+
+% ===========================================================================
+\chapter{Spring force laws and the implicit solve}
+\label{ch:springs}
+
+\section{Force laws}
+
+Every law is expressed in the form \eqref{eq:general-force-law},
+$\bm{F}^{\mathrm{c}} = H\Q f(Q)$. Internally the code works with the
+\emph{reduced} bond length and reduced natural length
+\begin{equation}
+  q = \frac{Q}{\sqrt{b}}, \qquad q_0 = \frac{\sigma}{\sqrt{b}},
+\end{equation}
+where $\sqrt{b}$ is the finite-extensibility parameter (\code{SpringParams::sqrtb})
+and $\sigma$ the natural length (\code{SpringParams::natural\_length}). The
+implemented $f$ are listed in Table~\ref{tab:force-laws}.
+
+\begin{table}[ht]
+\centering
+\caption{Spring force laws, as implemented in \code{force\_sans\_hookean}.
+$q=Q/\sqrt{b}$ is the reduced bond length and $q_0=\sigma/\sqrt{b}$ the reduced
+natural length.}
+\label{tab:force-laws}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Law & \code{Spring} & $f(q)$ \\
+\midrule
+Hookean & \code{Hook} & $1$ \\[0.4em]
+FENE & \code{FENE} & $\dfrac{1}{1-q^2}$ \\[0.7em]
+Inverse Langevin (Pad\'e) & \code{ILC} & $\dfrac{3-q^2}{3\left(1-q^2\right)}$ \\[0.7em]
+Worm-like chain (Marko--Siggia) & \code{WLC} &
+  $\dfrac{1}{6q}\left[4q + \dfrac{1}{(1-q)^2} - 1\right]$ \\[0.7em]
+Fraenkel & \code{Fraenkel} & $1 - \dfrac{q_0}{q}$ \\[0.7em]
+FENE--Fraenkel & \code{FENEFraenkel} &
+  $\dfrac{1-q_0/q}{1-(q-q_0)^2}$ \\[0.7em]
+Bounded WLC & \code{WLCbounded} & see \eqref{eq:wlcb-f} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The bounded (modified Marko--Siggia) law uses the reduced variable
+$t = (q-q_0)/(1-q_0)$ and reads
+\begin{equation}
+  f(q) = \frac{2}{3q}\left[
+    \frac{(1-t)^{-2}-1}{4} + t
+    - q_0\frac{(1+t)^{-2}-1}{4} + q_0 t
+  \right].
+  \label{eq:wlcb-f}
+\end{equation}
+
+Two limits are worth recording because they are asserted by the unit tests:
+FENE--Fraenkel with $q_0 = 0$ reduces exactly to FENE (so $\alpha \equiv b$ plays
+the role of the FENE $b$ parameter), and bounded WLC with $q_0 = 0$ reduces
+exactly to Marko--Siggia WLC.
+
+\section{Bead forces from bond forces}
+
+The force carried by bond $\mu$ is $\bm{F}^{\mathrm{c}}_\mu = f(q_\mu)\,\Q_\mu$
+(with $H=1$), and the force on the beads follows by differencing,
+\begin{equation}
+  \bm{F}^{\mathrm{S}}_1 = \bm{F}^{\mathrm{c}}_1, \qquad
+  \bm{F}^{\mathrm{S}}_\nu = \bm{F}^{\mathrm{c}}_\nu - \bm{F}^{\mathrm{c}}_{\nu-1}
+    \;\; (1<\nu<N), \qquad
+  \bm{F}^{\mathrm{S}}_N = -\bm{F}^{\mathrm{c}}_{N-1}.
+\end{equation}
+
+\section{Solving the implicit equation}
+
+Equation~\eqref{eq:magnitude} must be solved for $q$ given
+$\gamma \equiv \Gamma/\sqrt{b}$ and $\dt/4$. The laws fall into three families,
+handled by three different techniques; \code{solve\_implicit\_r} dispatches on
+the family and returns both the root and $f$ evaluated at it.
+
+\subsection{Closed form}
+
+\emph{Hookean:}
+\begin{equation}
+  q = \frac{\gamma}{1 + \dt/4}, \qquad f = 1 .
+\end{equation}
+
+\emph{Fraenkel:}
+\begin{equation}
+  q = \frac{\gamma + (\dt/4)\,q_0}{1 + \dt/4}, \qquad f = 1 - \frac{q_0}{q}.
+\end{equation}
+
+\subsection{Cubic family}
+
+For FENE, ILC, WLC and FENE--Fraenkel, \eqref{eq:magnitude} rearranges into a
+cubic
+\begin{equation}
+  c_3 q^3 + c_2 q^2 + c_1 q + c_0 = 0, \qquad c_3 = 1,
+\end{equation}
+with the coefficients given in Table~\ref{tab:cubic-coeffs}
+(writing $\beta \equiv \dt/4$).
+
+\begin{table}[ht]
+\centering
+\caption{Cubic coefficients, with $\beta = \dt/4$, $\gamma$ the reduced
+right-hand side and $q_0$ the reduced natural length
+(\code{cubic\_coefficients}).}
+\label{tab:cubic-coeffs}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Law & $c_0$ & $c_1$ & $c_2$ \\
+\midrule
+FENE & $\gamma$ & $-(1+\beta)$ & $-\gamma$ \\
+ILC  & $\dfrac{3\gamma}{3+\beta}$ & $-\dfrac{3+3\beta}{3+\beta}$ & $-\dfrac{3\gamma}{3+\beta}$ \\
+WLC  & $-\dfrac{3\gamma}{d}$ & $\dfrac{3(1+\beta+2\gamma)}{d}$ & $-\dfrac{3(4+3\beta+2\gamma)}{2d}$ \\
+FENE--Fraenkel & $\beta q_0 + \gamma(1-q_0^2)$ & $-1+q_0^2-\beta+2\gamma q_0$ & $-(2q_0+\gamma)$ \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+{\footnotesize For WLC, $d = 2\left(\tfrac{3}{2}+\beta\right)$.}
+\end{table}
+
+\subsubsection{Root selection for FENE--Fraenkel}
+
+The FENE--Fraenkel cubic is solved by the direct (trigonometric/Cardano) formula,
+selecting the root that lies in the physical interval. That such a root exists,
+and is unique, follows from evaluating the cubic $g(q)$ at the boundaries. In
+dimensional form with $\alpha = \delta Q^2$ and $\beta' = \tfrac14\alpha\dt$,
+\begin{align}
+  g(\infty) &> 0, \\
+  g(\sigma+\sqrt{\alpha}) &= -\beta'\sqrt{\alpha} < 0, \\
+  g(\sigma-\sqrt{\alpha}) &= +\beta'\sqrt{\alpha} > 0, \\
+  g(0) &= \beta' + (\alpha-\sigma^2)\,\Gamma > 0 \quad\text{if } \sqrt{\alpha}\ge\sigma, \\
+  g(-\infty) &< 0 .
+\end{align}
+Hence exactly one root lies between $\max(0,\,\sigma-\sqrt{\alpha})$ and
+$\sigma+\sqrt{\alpha}$, and that is the physical bond length. In reduced units
+the bracket used by the code is
+\begin{equation}
+  q \in \left[\max(q_0-1,\,0),\; q_0+1\right].
+  \label{eq:ff-bracket}
+\end{equation}
+
+\subsubsection{Approximate root plus Newton polish}
+
+For FENE, ILC and WLC the root is instead approximated and then polished by
+Newton--Raphson on the cubic. The initial guess is Hookean at small $\gamma$ and
+asymptotic at large $\gamma$ (where $q\to1$):
+\begin{equation}
+  q^{(0)} =
+  \begin{cases}
+    \dfrac{\gamma}{1+\beta}, & \gamma < 1,\\[0.8em]
+    1 - \dfrac{\beta}{2\gamma}, & \text{FENE},\\[0.7em]
+    1 - \dfrac{\beta}{3\gamma}, & \text{ILC},\\[0.7em]
+    1 - \sqrt{\dfrac{\beta}{6\gamma}}, & \text{WLC}.
+  \end{cases}
+\end{equation}
+The polish is skipped for WLC when $\gamma > 100$, where Newton iterations
+wander off the physical root and the asymptotic guess is already accurate.
+
+\subsection{Transcendental family: bounded WLC}
+
+The bounded WLC does not reduce to a polynomial. Its implicit equation is
+\begin{multline}
+  \frac{6\gamma}{\dt} = \frac{6q}{\dt}
+    + \frac{1}{4}\left(\frac{1-\sigma}{1-q}\right)^{2} - \frac{1}{4}
+    + \frac{q-\sigma}{1-\sigma} \\
+    - \frac{\sigma}{4}\left(\frac{1-\sigma}{1+q-2\sigma}\right)^{2}
+    + \frac{\sigma}{4} + \sigma\frac{q-\sigma}{1-\sigma},
+  \label{eq:wlcb-implicit}
+\end{multline}
+which is solved by \code{rtsafe} (safeguarded Newton with bisection fallback) on
+the bracket
+\begin{equation}
+  q \in \left[\max(0,\,2\sigma-1)+\epsilon,\; 1-\epsilon\right],
+\end{equation}
+$\epsilon$ being machine epsilon. The analytic derivative required by
+\code{rtsafe} is
+\begin{equation}
+  \frac{\partial}{\partial q} = \frac{6}{\dt} + \frac{1}{1-\sigma} + \frac{\sigma}{1-\sigma}
+    + \frac{(1-\sigma)^2}{2(1-q)^3}
+    + \frac{(1-\sigma)^2\sigma}{2(1-2\sigma+q)^3}.
+\end{equation}
+
+\paragraph{Lookup tables are not implemented.} The thesis describes an adaptive
+lookup table built once at start-up to avoid repeated \code{rtsafe} calls for
+this law. The current code solves \eqref{eq:wlcb-implicit} directly at every
+step. This is a deliberate simplification: it removes a large amount of
+table-construction machinery and a class of interpolation-accuracy questions, at
+the cost of making the bounded WLC the slowest law. If bounded-WLC runs become a
+bottleneck the table can be reinstated behind the same interface, since
+\code{solve\_implicit\_r} is a pure function of $(\text{law}, \beta, \gamma, q_0)$.
+
+\section{Robustness of the solve}
+\label{sec:spring-robustness}
+
+Two safeguards are present that are not in the thesis. Both were added after
+diagnosing intermittent blow-ups in long FENE--Fraenkel runs with HI, and both
+are covered by \code{tests/test\_hi\_stability.cpp}.
+
+\paragraph{Bracketed fallback for the cubic.} The closed-form cubic solution
+loses accuracy for extreme coefficients. For $\gamma \gtrsim 10^{10}$ --- which
+can occur transiently if the Brownian displacement is momentarily very large ---
+the trigonometric formula could return a spurious root of order $\gamma$,
+\emph{outside} the physical bracket \eqref{eq:ff-bracket}, bypassing finite
+extensibility entirely and producing an unbounded bond. \code{find\_roots\_cubic}
+now checks that the returned root lies in $[\,q_{\mathrm{lo}}, q_{\mathrm{hi}}]$
+and, if not, falls back to bisection on that bracket, which cannot fail.
+
+\paragraph{Strict interior clamping.} After polishing, the root is clamped
+strictly inside the singularities of $f$:
+\begin{equation}
+  q \leftarrow \min\!\left(\max(q,\; q_{\mathrm{lo}}+\delta),\; q_{\mathrm{hi}}-\delta\right),
+  \qquad \delta = 10^{-6},
+\end{equation}
+with $(q_{\mathrm{lo}},q_{\mathrm{hi}}) = (\max(q_0-1,0),\,q_0+1)$ for
+FENE--Fraenkel and $(0,1)$ for FENE/ILC/WLC. Because $f$ diverges at those
+endpoints, landing exactly on one produces a non-finite force; the clamp
+guarantees the spring force is finite for \emph{any} $\gamma$, which is precisely
+the stability property the semi-implicit scheme is supposed to provide. Tests
+assert boundedness up to $\gamma = 10^{20}$.
+
+% ===========================================================================
+\chapter{Hydrodynamic interaction}
+\label{ch:hi}
+
+Setting $h^{*} = 0$ gives free draining, $\D = \bm{\delta}$ (identity), and
+$\B = \bm{\delta}$; the Brownian displacement is then simply
+$\sqrt{\dt}\,\bm{X}_0$. Everything below concerns $h^{*} > 0$.
+
+\section{The RPY diffusion tensor}
+\label{sec:rpy}
+
+$\D$ is a $3N\times3N$ block matrix. The diagonal blocks are the identity (bead
+self-mobility), and the off-diagonal blocks use the Rotne--Prager--Yamakawa form,
+which is constructed to remain positive semi-definite for all configurations.
+For beads $\mu\ne\nu$ separated by $\bm{b} = \bm{r}_\nu - \bm{r}_\mu$ with
+$r = \|\bm{b}\|$,
+\begin{equation}
+  \D_{\mu\nu} = \omega_1(r)\,\bm{\delta} + \omega_2(r)\,\bm{b}\bm{b},
+  \label{eq:rpy-block}
+\end{equation}
+with two branches at the overlap radius $r = 2a^{*} = 2\sqrt{\pi}h^{*}$:
+\begin{equation}
+  \boxed{
+  \begin{aligned}
+    r \ge 2\sqrt{\pi}h^{*}:\quad
+      \omega_1 &= \tfrac{3}{4}\sqrt{\pi}\,\frac{h^{*}}{r}
+                  \left[1 + \tfrac{2\pi}{3}\left(\tfrac{h^{*}}{r}\right)^{2}\right], &
+      \omega_2 &= \tfrac{3}{4}\sqrt{\pi}\,\frac{h^{*}}{r^{3}}
+                  \left[1 - 2\pi\left(\tfrac{h^{*}}{r}\right)^{2}\right],\\[0.5em]
+    r < 2\sqrt{\pi}h^{*}:\quad
+      \omega_1 &= 1 - \frac{9}{32\sqrt{\pi}}\,\frac{r}{h^{*}}, &
+      \omega_2 &= \frac{3}{32\sqrt{\pi}}\,\frac{1}{h^{*} r} .
+  \end{aligned}}
+  \label{eq:rpy-omegas}
+\end{equation}
+Substituting $a^{*} = \sqrt{\pi}h^{*}$ recovers the familiar textbook form: the
+far-field branch is
+$\D_{\mu\nu} = \tfrac{3a}{4r}\left[\left(1+\tfrac{2a^{2}}{3r^{2}}\right)\bm{\delta}
+ + \left(1-\tfrac{2a^{2}}{r^{2}}\right)\tfrac{\bm{b}\bm{b}}{r^{2}}\right]$
+and the near-field branch is
+$\D_{\mu\nu} = \left(1-\tfrac{9r}{32a}\right)\bm{\delta} + \tfrac{3}{32ar}\bm{b}\bm{b}$.
+Squared separations below $10^{-12}$ are clamped to avoid a singularity for
+coincident beads.
+
+\section{The Brownian displacement}
+\label{sec:brownian-step}
+
+What is actually required is never $\B$ itself but the product
+\begin{equation}
+  \Delta\bm{S} = \sqrt{\dt}\;\B\cdot\bm{X}_0,
+  \qquad \D = \B\cdot\B^{\mathsf{T}} .
+  \label{eq:delS}
+\end{equation}
+Note that \eqref{eq:delS} does not determine $\B$ uniquely --- any $\B$
+satisfying $\D = \B\B^{\mathsf{T}}$ gives $\Delta\bm{S}$ the correct covariance,
+which is all the SDE requires. The code offers two constructions.
+
+\subsection{Cholesky factorisation}
+
+$\B = \bm{L}$, the lower triangular Cholesky factor of $\D$, so that
+$\Delta S_i = \sum_{j\le i} L_{ij} X_{0,j}$. This is exact and unconditionally
+stable, and costs $O(N^3)$. It is the reference against which the approximate
+method is checked.
+
+\subsection{Chebyshev approximation}
+
+The alternative approximates the \emph{symmetric} square root by a Chebyshev
+polynomial in $\D$, requiring only matrix--vector products and hence
+$O(N_T N^2)$ work for $N_T$ terms.
+
+The construction rests on two facts: the eigenvectors of $\D$ are also
+eigenvectors of any polynomial in $\D$, with eigenvalues transformed by that
+polynomial; and $\sqrt{\D} = \sum_k \lambda_k^{1/2}\bm{v}_k\bm{v}_k$ in the
+spectral representation. So a scalar polynomial approximating $\sqrt{\lambda}$
+over the spectral range, applied to $\D$, approximates $\sqrt{\D}$.
+
+Let the spectrum lie in $[\lambda_{\min}, \lambda_{\max}]$. Map $\D$ onto the
+Chebyshev interval $[-1,1]$ via
+\begin{equation}
+  \D' = d_a \D + d_b \bm{\delta}, \qquad
+  d_a = \frac{2}{\lambda_{\max}-\lambda_{\min}}, \qquad
+  d_b = -\frac{\lambda_{\max}+\lambda_{\min}}{\lambda_{\max}-\lambda_{\min}} .
+\end{equation}
+The coefficients for $\sqrt{\cdot}$ with $L+1$ nodes are
+\begin{equation}
+  \lambda_k = \frac{1}{d_a}\cos\!\left[\frac{\pi(k+\tfrac12)}{L+1}\right] - \frac{d_b}{d_a},
+  \qquad k = 0,\dots,L,
+\end{equation}
+\begin{equation}
+  a_p = \frac{2}{L+1}\sum_{k=0}^{L}\sqrt{\lambda_k}\,
+        \cos\!\left[\frac{p\,(k+\tfrac12)\pi}{L+1}\right],
+  \qquad a_0 \leftarrow \tfrac{a_0}{2}.
+\end{equation}
+The product with $\bm{X}_0$ is then accumulated using the three-term recurrence
+directly on vectors, never forming a matrix:
+\begin{equation}
+  \bm{V}_0 = \bm{X}_0, \qquad
+  \bm{V}_1 = \D'\cdot\bm{X}_0, \qquad
+  \bm{V}_p = 2\,\D'\cdot\bm{V}_{p-1} - \bm{V}_{p-2},
+\end{equation}
+\begin{equation}
+  \B\cdot\bm{X}_0 \;\approx\; \sum_{p=0}^{L} a_p \bm{V}_p .
+\end{equation}
+The initial number of terms follows Fixman's scaling,
+\begin{equation}
+  L = \left\lfloor \mu_{\mathrm{cheb}}\sqrt{\frac{\lambda_{\max}}{\lambda_{\min}}} + \tfrac12 \right\rfloor + 1,
+  \label{eq:ncheb}
+\end{equation}
+clamped to $[2, N_{\mathrm{cheb}}^{\max}]$ with $N_{\mathrm{cheb}}^{\max} = 500$
+and $\mu_{\mathrm{cheb}}$ a user multiplier. Since
+$\lambda_{\max}/\lambda_{\min}$ scales roughly as $N^{1/2}$ near equilibrium and
+as $N$ for stretched chains, the total cost scales between $N^{2.25}$ and
+$N^{2.5}$, versus $N^{3}$ for Cholesky.
+
+\subsection{Fluctuation--dissipation error control}
+
+After evaluating the series, the fluctuation--dissipation identity is checked:
+\begin{equation}
+  \varepsilon_{\mathrm{FD}}
+    = \frac{\left|\;\|\B\cdot\bm{X}_0\|^{2} - \bm{X}_0\cdot\D\cdot\bm{X}_0\;\right|}
+           {\bm{X}_0\cdot\D\cdot\bm{X}_0} ,
+  \label{eq:fd}
+\end{equation}
+which must vanish for an exact square root. If $\varepsilon_{\mathrm{FD}}$
+exceeds the tolerance \code{fd\_err\_max}, $L$ is increased by $\max(1, L/4)$ and
+the series re-evaluated, up to $N_{\mathrm{cheb}}^{\max}$.
+
+\section{Spectral bounds}
+\label{sec:spectral-bounds}
+
+\subsection{Why the interval must contain the spectrum}
+
+The Chebyshev polynomial approximates $\sqrt{\cdot}$ \emph{only} on
+$[\lambda_{\min},\lambda_{\max}]$. Outside that interval it does not merely lose
+accuracy: Chebyshev polynomials grow like $\cosh$ beyond $\pm1$, so any
+eigencomponent of $\bm{X}_0$ whose eigenvalue lies below $\lambda_{\min}$ (or
+above $\lambda_{\max}$) is \emph{amplified} rather than square-rooted. Repeated
+over many steps this pumps energy into the corresponding mode and the trajectory
+diverges. Containment of the spectrum is therefore a correctness requirement, not
+an accuracy preference.
+
+\subsection{The Fixman estimate and why it was replaced}
+
+The thesis (and the original Fortran) estimates the extremes with two
+matrix--vector products,
+\begin{equation}
+  d_{\max} = \frac{2}{3N}\,\D : \bm{u}^{+}\bm{u}^{+},
+  \qquad
+  d_{\min} = \frac{1}{2\cdot 3N}\,\D : \bm{u}^{-}\bm{u}^{-},
+  \label{eq:fixman}
+\end{equation}
+where $\bm{u}^{+}$ has all components $+1$ (fully cooperative motion, fastest
+diffusion) and $\bm{u}^{-}$ alternates in sign (the opposite extreme). This is
+cheap and physically motivated.
+
+It is, however, \emph{not a bound}. Both expressions are Rayleigh quotients (up
+to constant factors), and a Rayleigh quotient always lies strictly between
+$\lambda_{\min}$ and $\lambda_{\max}$. Consequently \eqref{eq:fixman}
+systematically \emph{overestimates} $\lambda_{\min}$. For compact configurations
+the gap is harmless, but stretched chains develop a small eigenvalue that
+$\bm{u}^{-}$ does not resolve. Measured on a stretched $N=30$ configuration, the
+estimate gave $d_{\min} = 0.379$ against a true $\lambda_{\min} = 0.139$; noise
+aligned with the smallest eigenvector then produced
+$\varepsilon_{\mathrm{FD}} \sim 10^{158}$ and an immediate blow-up. This was the
+root cause of the intermittent instabilities discussed in
+Section~\ref{sec:spring-robustness}.
+
+\subsection{Lanczos estimate with Sturm bisection (current implementation)}
+
+The code now estimates the extreme eigenvalues by an $m$-step Lanczos iteration
+with full re-orthogonalisation ($m = 30$ by default, capped at $3N$). Lanczos
+builds an orthonormal basis $\{\bm{v}_1,\dots,\bm{v}_m\}$ and a symmetric
+tridiagonal projection
+\begin{equation}
+  \bm{T}_m =
+  \begin{pmatrix}
+    \alpha_1 & \beta_1 & & \\
+    \beta_1 & \alpha_2 & \ddots & \\
+     & \ddots & \ddots & \beta_{m-1}\\
+     & & \beta_{m-1} & \alpha_m
+  \end{pmatrix},
+  \qquad
+  \begin{aligned}
+    \alpha_j &= \bm{v}_j\cdot\D\cdot\bm{v}_j,\\
+    \beta_j  &= \|\bm{w}_j\|,
+  \end{aligned}
+\end{equation}
+whose extreme eigenvalues (Ritz values) converge to those of $\D$ far faster than
+power iteration. The extreme Ritz values are extracted by bisection on the Sturm
+sequence of $\bm{T}_m$: the number of eigenvalues of $\bm{T}_m$ below $x$ is the
+number of negative entries in
+\begin{equation}
+  d_1 = \alpha_1 - x, \qquad
+  d_j = (\alpha_j - x) - \frac{\beta_{j-1}^{2}}{d_{j-1}},
+\end{equation}
+and the search interval is initialised from the Gershgorin bounds of
+$\bm{T}_m$.
+
+Ritz values bracket the true spectrum from the \emph{inside}, so they are padded
+outwards to obtain the interval actually used:
+\begin{equation}
+  \lambda_{\min} = 0.5\,\theta_{\min}, \qquad
+  \lambda_{\max} = 1.02\,\theta_{\max},
+  \label{eq:padding}
+\end{equation}
+with $\theta$ the extreme Ritz values. Verified over $200$ configurations sampled
+along real trajectories, \eqref{eq:padding} contained the spectrum in every case.
+
+\subsection{Warm-starting the Lanczos iteration}
+\label{sec:warm-start}
+
+Lanczos converges to the extremes quickly, but $m$ matrix--vector products per
+step is still expensive next to the two of \eqref{eq:fixman}. The saving comes
+from the observation that over a single timestep the configuration --- and hence
+the spectrum \emph{and its extremal eigenvectors} --- barely changes. Seeding the
+Krylov space with the previous step's extremal Ritz vectors therefore reaches the
+same accuracy in far fewer iterations: the implementation uses $m = 30$ for a cold
+start and $m = 8$ once warm.
+
+The Ritz vectors are recovered at no extra matrix--vector cost. The Lanczos basis
+$\bm{V}$ is already stored for re-orthogonalisation, and the eigenvector $\bm{y}$
+of the tridiagonal $\bm{T}_m$ for a converged Ritz value is obtained by two steps
+of inverse iteration (an $O(m)$ tridiagonal solve, shifted slightly off the
+eigenvalue to stay non-singular); the Ritz vector is then
+$\bm{V}^{\mathsf{T}}\bm{y}$.
+
+Two failure modes are guarded explicitly.
+\begin{itemize}
+  \item \emph{Krylov breakdown.} Seeding with $\bm{v}_{\min}$ alone is
+        dangerous: if it is already close to an exact eigenvector, Lanczos
+        terminates after one step and never sees $\lambda_{\max}$. The seed is
+        therefore built to be rich in \emph{both} extremes,
+        \begin{equation}
+          \bm{v}_{\mathrm{seed}} \propto
+            \bm{v}_{\min} + \bm{v}_{\max} + 10^{-2}\,\hat{\bm{u}},
+        \end{equation}
+        with $\hat{\bm{u}}$ the deterministic cold-start vector, whose small
+        admixture makes degeneracy impossible.
+  \item \emph{Early termination.} If a warm run still collapses into an invariant
+        subspace in fewer than four iterations, its bounds are discarded and the
+        step is redone cold.
+\end{itemize}
+
+Correctness does not rest on any of this. The bounds feed only the choice of
+Chebyshev interval; the fluctuation--dissipation test \eqref{eq:fd} and the
+Cholesky fallback below still police the result, so a poor seed costs time, never
+accuracy. That the warm-started interval nevertheless does contain the spectrum is
+asserted directly by \code{test\_hi\_stability}, which compares the bounds against
+exact (Jacobi) eigenvalues at intervals along an evolving trajectory.
+
+\subsection{Cholesky fallback}
+
+Padding makes containment overwhelmingly likely but cannot make it a theorem. The
+final safety net is therefore in \code{Diffusion::brownian\_step}: if
+$\varepsilon_{\mathrm{FD}}$ from \eqref{eq:fd} still exceeds tolerance after the
+term-growth loop, that single step falls back to the exact Cholesky factor. This
+trades speed for correctness on the rare problematic step and makes divergence
+structurally impossible.
+
+\subsection{Cost}
+
+The bound estimator is the dominant cost of the Chebyshev path, so warm-starting
+it (Section~\ref{sec:warm-start}) roughly halves the total. Before warm-starting,
+at $N=51$, $h^{*}=0.2$, the Chebyshev step cost $433\,\mu$s of which about
+$330\,\mu$s ($\approx76\%$) was the estimator; it now costs $223\,\mu$s.
+Table~\ref{tab:hi-cost} gives the effect across chain lengths.
+
+The practical consequence is that the crossover between the two square-root
+methods has moved down from $N \approx 100$ to $N \approx 40$: at $N=51$
+Chebyshev is now the faster method, where previously the exact Cholesky
+factorisation beat it.
+
+\begin{table}[ht]
+\centering
+\caption{Measured per-step cost of the two square-root methods, FENE--Fraenkel
+chain, $h^{*}=0.2$, $\dt = 10^{-3}$, single core. ``Chebyshev before'' is with a
+cold Lanczos start at every step.}
+\label{tab:hi-cost}
+\begin{tabular}{@{}rrrrrl@{}}
+\toprule
+$N$ & Cheb.\ before ($\mu$s) & Cheb.\ now ($\mu$s) & speed-up & Cholesky ($\mu$s) & faster now \\
+\midrule
+20  & 112  & 37   & $3.1\times$ & 24    & Cholesky \\
+51  & 479  & 223  & $2.2\times$ & 250   & Chebyshev \\
+100 & 1760 & 1037 & $1.7\times$ & 1983  & Chebyshev \\
+200 & 8028 & 4659 & $1.7\times$ & 15799 & Chebyshev \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The cache is per integration call.} \code{SpectralCache} lives in the
+\code{Mobility}, which is constructed by \code{PhysicalModel} once per call to
+\code{time\_integrate\_chain}. The warm start therefore accelerates steps
+\emph{within} one call but is cold on the first step of each call. This is
+immaterial for normal use, where a call spans many steps, but it does mean the
+benefit is lost if the integrator is driven one step at a time:
+
+\begin{center}
+\begin{tabular}{@{}rr@{}}
+\toprule
+steps per call & cost ($\mu$s/step, $N=51$) \\
+\midrule
+200 & 217 \\
+50  & 225 \\
+10  & 239 \\
+1   & 439 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Driving the integrator a single step at a time --- as an external ODE coupling
+would --- returns the cost to the cold-start value. Recovering it there would mean
+giving the Python layer a persistent integrator object that owns the
+\code{PhysicalModel} across calls, rather than rebuilding it per call.
+
+\paragraph{Further optimisation.} One further saving remains available and is not
+implemented: recomputing the bounds only every $K$ steps and reusing them in
+between, which is safe for the same reason warm-starting is (the spectrum moves
+slowly) and is likewise policed by the fluctuation--dissipation check.
+
+% ===========================================================================
+\chapter{Bending potential}
+\label{ch:bending}
+
+\section{Potential and forces}
+
+The implemented bending potential is
+\begin{equation}
+  \frac{\phi_{\mathrm{b},\mu}}{\kB T} = C\left(1-\cos\theta_\mu\right),
+  \label{eq:bending-potential}
+\end{equation}
+where $C$ is the rigidity constant (\code{BendingParams::stiffness}) and
+\begin{equation}
+  \theta_\mu = \arccos\left(\uv_{\mu-1}\cdot\uv_{\mu}\right)
+\end{equation}
+is the angle at bead $\mu$ between adjacent bond unit vectors.
+
+Bead $\mu$ feels contributions from three angles --- its own and its two
+neighbours':
+\begin{equation}
+  \bm{F}^{\mathrm{b}}_\mu
+    = \bm{F}^{\mathrm{b}}_{\mu,\mu}
+    + \bm{F}^{\mathrm{b}}_{\mu,\mu-1}
+    + \bm{F}^{\mathrm{b}}_{\mu,\mu+1},
+\end{equation}
+each obtained as $-\partial\phi_{\mathrm{b},\mu'}/\partial\bm{r}_\mu$ via the
+chain rule. The geometric factors are
+\begin{equation}
+  \frac{\partial\theta_\mu}{\partial\uv_\mu} = -\frac{\uv_{\mu-1}}{\sin\theta_\mu},
+  \qquad
+  \frac{\partial\theta_\mu}{\partial\uv_{\mu-1}} = -\frac{\uv_{\mu}}{\sin\theta_\mu},
+\end{equation}
+\begin{equation}
+  \frac{\partial\uv_\mu}{\partial\bm{r}_\mu} = \frac{1}{Q_\mu}\left(\uv_\mu\uv_\mu-\bm{\delta}\right),
+  \qquad
+  \frac{\partial\uv_{\mu-1}}{\partial\bm{r}_\mu} = \frac{1}{Q_{\mu-1}}\left(\bm{\delta}-\uv_{\mu-1}\uv_{\mu-1}\right).
+\end{equation}
+Combining these gives the general result
+\begin{multline}
+  \bm{F}^{\mathrm{b}}_\mu =
+   \frac{\partial\phi_{\mathrm{b},\mu}}{\partial\theta_\mu}\frac{1}{\sin\theta_\mu}
+   \left[\frac{\cos\theta_\mu\,\uv_\mu-\uv_{\mu-1}}{Q_\mu}
+       + \frac{-\cos\theta_\mu\,\uv_{\mu-1}+\uv_\mu}{Q_{\mu-1}}\right]\\
+ + \frac{\partial\phi_{\mathrm{b},\mu-1}}{\partial\theta_{\mu-1}}\frac{1}{\sin\theta_{\mu-1}}
+   \left[\frac{-\cos\theta_{\mu-1}\,\uv_{\mu-1}+\uv_{\mu-2}}{Q_{\mu-1}}\right]\\
+ + \frac{\partial\phi_{\mathrm{b},\mu+1}}{\partial\theta_{\mu+1}}\frac{1}{\sin\theta_{\mu+1}}
+   \left[\frac{\cos\theta_{\mu+1}\,\uv_\mu-\uv_{\mu+1}}{Q_\mu}\right].
+\end{multline}
+
+For the specific potential \eqref{eq:bending-potential},
+$-\partial\phi_{\mathrm{b},i}/\partial\theta_i = -\kB T\,C\sin\theta_i$, so every
+$\sin\theta$ cancels --- which is why no small-angle guard is needed in the code
+--- leaving
+\begin{equation}
+  \boxed{
+  \begin{aligned}
+  \frac{\bm{F}^{\mathrm{b}}_\mu}{\kB T\,C} =\;
+   &\left[\frac{\cos\theta_\mu\,\uv_\mu-\uv_{\mu-1}}{Q_\mu}
+       + \frac{-\cos\theta_\mu\,\uv_{\mu-1}+\uv_\mu}{Q_{\mu-1}}\right] \\
+ &+ \left[\frac{-\cos\theta_{\mu-1}\,\uv_{\mu-1}+\uv_{\mu-2}}{Q_{\mu-1}}\right]
+  + \left[\frac{\cos\theta_{\mu+1}\,\uv_\mu-\uv_{\mu+1}}{Q_\mu}\right].
+  \end{aligned}}
+  \label{eq:bending-force}
+\end{equation}
+The chain ends keep only the terms that exist: bead $1$ retains only the third
+bracket and bead $N$ only the second, which is exactly how \code{bending.cpp}
+special-cases $\nu = 1$, $2$, $N-1$, $N$ (and the whole $N=3$ case) around the
+general interior loop.
+
+\paragraph{A sign discrepancy in the literature.} Equation~\eqref{eq:bending-force}
+differs from the corresponding expression of Saadat and Khomami in the sign of
+the $-\cos\theta_{\mu-1}\uv_{\mu-1}$ term. Given that the form above reproduces
+hand-computed forces for 3-, 4- and 5-bead configurations and yields the correct
+equilibrium angle distribution, the published expression is very likely a
+typographical error.
+
+\section{Equilibrium angle distribution}
+
+Because the spring and bending contributions to the configurational integral
+separate (the spring potential depends only on $Q$, not orientation), the
+equilibrium angle distribution follows from the bending potential alone:
+\begin{equation}
+  \psi_{\mathrm{eq}}(\theta)
+    = \frac{\sin\theta\,e^{-\phi_\mathrm{b}/\kB T}}
+           {\int_0^\pi \sin\theta\,e^{-\phi_\mathrm{b}/\kB T}\,\mathrm{d}\theta}
+    = \left[\frac{C}{1-e^{-2C}}\right]\sin\theta\;e^{-C(1-\cos\theta)} ,
+  \label{eq:angle-dist}
+\end{equation}
+with moments
+\begin{equation}
+  \langle\cos\theta\rangle = \coth C - \frac{1}{C},
+  \qquad
+  \langle\cos^{2}\theta\rangle
+    = \frac{2e^{-C}\left[(C^{2}+2)\sinh C - 2C\cosh C\right]}{C^{2}\left(1-e^{-2C}\right)} .
+\end{equation}
+Equation~\eqref{eq:angle-dist} is both a validation target and the sampling
+distribution used to build correlated initial configurations
+(Section~\ref{sec:mc-chain}).
+
+% ===========================================================================
+\chapter{Excluded volume}
+\label{ch:ev}
+
+Excluded volume acts pairwise between beads separated by at least
+\code{contour\_dist\_for\_EV} along the chain. For each such pair, with
+$\bm{q} = \bm{r}_\nu-\bm{r}_\mu$ and $r = \|\bm{q}\|$, a scalar factor
+$\Phi(r)$ is formed and the force applied antisymmetrically,
+\begin{equation}
+  \bm{F}^{\mathrm{EV}}_\mu \mathrel{-}= \Phi(r)\,\bm{q},
+  \qquad
+  \bm{F}^{\mathrm{EV}}_\nu \mathrel{+}= \Phi(r)\,\bm{q},
+\end{equation}
+so that $\Phi > 0$ is repulsive. Three functional forms are implemented.
+
+\paragraph{Gaussian.}
+\begin{equation}
+  \Phi_{\mathrm{G}}(r) = \frac{z^{*}}{d^{*5}}\exp\!\left(-\frac{r^{2}}{2d^{*2}}\right),
+\end{equation}
+with $z^{*}$ the dimensionless EV strength and $d^{*}$ the EV range.
+
+\paragraph{Lennard-Jones.}
+\begin{equation}
+  \Phi_{\mathrm{LJ}}(r) = \frac{48 z^{*} d^{*12}}{r^{14}} - \frac{24 z^{*} d^{*6}}{r^{8}},
+\end{equation}
+i.e.\ the standard $12$--$6$ force divided by $r$. It is evaluated for
+$R_{\min} \le r \le R_{\mathrm{cut}}$, held at its $R_{\min}$ value for
+$r < R_{\min}$ (a soft core that prevents overflow at small separations), and set
+to zero beyond the cutoff. The cutoff depends on the run mode:
+\begin{equation}
+  R_{\mathrm{cut}} =
+  \begin{cases}
+    d^{*}2^{1/6}, & \text{equilibration (purely repulsive, WCA)},\\
+    R_{\mathrm{cut}}^{\mathrm{p}}, & \text{production.}
+  \end{cases}
+\end{equation}
+
+\paragraph{Soddemann--D\"{u}nweg--Kremer (SDK).} The repulsive core is the LJ form
+with $z^{*}$ omitted,
+\begin{equation}
+  \Phi_{\mathrm{SDK}}(r) = \frac{48 d^{*12}}{r^{14}} - \frac{24 d^{*6}}{r^{8}},
+  \qquad R_{\min}\le r \le d^{*}2^{1/6},
+\end{equation}
+augmented, in production runs only, by a cosine tail over
+$d^{*}2^{1/6} < r \le R_{\mathrm{cut}}^{\mathrm{p}}$:
+\begin{equation}
+  \Phi_{\mathrm{SDK}} \mathrel{+}= \alpha_{\mathrm{SDK}}\,\varphi_{\mu\nu}
+    \sin\!\left(\alpha_{\mathrm{SDK}} r^{2} + \beta_{\mathrm{SDK}}\right),
+\end{equation}
+\begin{equation}
+  \alpha_{\mathrm{SDK}} = 1.530633312, \qquad \beta_{\mathrm{SDK}} = 1.213115524 ,
+\end{equation}
+where $\varphi_{\mu\nu}$ is a per-pair attractive strength supplied as an
+$N\times N$ table. The \code{SDK\_stickers} variant is not implemented.
+
+The equilibration flag is fixed for a run and baked into the
+\code{ExcludedVolume} object at construction rather than passed per call.
+
+% ===========================================================================
+\chapter{Random number generation}
+\label{ch:rng}
+
+The generator is a bit-exact port of the Numerical Recipes \code{ran\_1} routine
+used by the original Fortran, retained so that regression tests can compare the
+two codes at machine precision. Each draw combines a Marsaglia xorshift with a
+Park--Miller multiplicative congruential generator evaluated by Schrage's method.
+
+With $\mathrm{IA}=16807$, $\mathrm{IM}=2^{31}-1$, $\mathrm{IQ}=127773$,
+$\mathrm{IR}=2836$, the state $(i_x, i_y)$ evolves as
+\begin{align}
+  i_x &\leftarrow i_x \oplus (i_x \ll 13), \quad
+  i_x \leftarrow i_x \oplus (i_x \gg 17), \quad
+  i_x \leftarrow i_x \oplus (i_x \ll 5), \\
+  k &= \lfloor i_y/\mathrm{IQ}\rfloor, \qquad
+  i_y \leftarrow \mathrm{IA}\,(i_y - k\,\mathrm{IQ}) - \mathrm{IR}\,k,
+  \qquad i_y \leftarrow i_y + \mathrm{IM}\;\text{if } i_y<0,
+\end{align}
+and the returned deviate is
+\begin{equation}
+  X = a_m \cdot \left[\left(\mathrm{IM} \;\&\; (i_x \oplus i_y)\right) \;|\; 1\right],
+  \qquad
+  a_m = \frac{\mathrm{nearest}(1,-1)}{\mathrm{IM}} .
+\end{equation}
+Seeding from $s$ sets $i_y = (888889999 \oplus |s|)\,|\,1$ and
+$i_x = 777755555 \oplus |s|$.
+
+Two implementation details matter for exactness. The right shift must be
+\emph{logical} (zero-filling), matching Fortran's \code{ishft}, so $i_x$ is
+manipulated as an unsigned 32-bit quantity. And $a_m$ is a \emph{single
+precision} constant in the Fortran; keeping it single makes the stream
+single-precision granular, and it is deliberately not promoted to double.
+
+The generator state is encapsulated in an \code{Rng} object with
+\code{save()}/\code{restore()}, rather than living in global module state. This
+supports variance-reduction schemes, in which two chains must consume an
+identical random stream, and makes segmented integration reproducible.
+
+% ===========================================================================
+\chapter{Initial configurations}
+\label{ch:initial}
+
+Initial configurations are generated in Python (\code{python/bdsim/initial.py}).
+All samplers use inverse-transform sampling: for a one-dimensional density $p(X)$
+with cumulative distribution $P$, if $Y\sim\mathcal{U}[0,1]$ then $X = P^{-1}(Y)$
+is distributed as $p$.
+
+\section{Gaussian chain}
+
+Each bond is an isotropic Gaussian; bead positions are the cumulative sum,
+recentred on the centre of mass. Adequate whenever the run equilibrates from the
+starting state.
+
+\section{FENE--Fraenkel equilibrium chain}
+
+The equilibrium bond-length density for a FENE--Fraenkel connector follows from
+the potential
+\begin{equation}
+  \phi_{\mathrm{eq}} = -\frac{H\,\delta Q^{2}}{2}
+    \ln\!\left[1-\frac{(Q-\sigma)^{2}}{\delta Q^{2}}\right]
+\end{equation}
+via $\psi_{\mathrm{eq}}(Q) \propto Q^{2}e^{-\phi_{\mathrm{eq}}/\kB T}$, giving
+\begin{equation}
+  \psi_{\mathrm{eq}}(Q) \;\propto\; Q^{2}
+    \left[1-\frac{(Q-\sigma)^{2}}{\alpha}\right]^{\alpha/2},
+  \qquad \alpha = \delta Q^{2},
+  \label{eq:ff-eq-dist}
+\end{equation}
+supported on $\max(0,\sigma-\delta Q) \le Q \le \sigma+\delta Q$. (The exponent is
+$H\delta Q^{2}/2\kB T = \alpha/2$ in Hookean units.) The normalisation can be
+obtained in closed form,
+\begin{equation}
+  J_{\mathrm{eq}} = \frac{\delta Q\left[\delta Q^{2}+(3+2c)\sigma^{2}\right]}{3+2c}\,
+                    \mathrm{B}\!\left(\tfrac12,\,1+c\right),
+  \qquad c = \frac{H\,\delta Q^{2}}{2\kB T},
+\end{equation}
+with $\mathrm{B}$ the Beta function, though the code does not need it: it
+tabulates \eqref{eq:ff-eq-dist} on a grid of $10^{4}$ points, forms the cumulative
+trapezoidal integral, normalises it to $[0,1]$, and inverts by linear
+interpolation. Grid endpoints are inset by $10^{-7}$ to avoid the integrable
+singularities in the derivative. Bond directions are then either isotropic on the
+unit sphere (Marsaglia's rejection method) or all along $x$, giving
+\code{fene\_fraenkel\_chain} and \code{fene\_fraenkel\_chain\_aligned\_x}
+respectively.
+
+\section{Correlated chains with a bending potential}
+\label{sec:mc-chain}
+
+For a chain with both a spring and a bending potential the two contributions to
+the configurational integral separate, so bond lengths and bond angles may be
+sampled independently and then assembled. Bond lengths come from
+\eqref{eq:ff-eq-dist}; included angles come from \eqref{eq:angle-dist}, which for
+the $C(1-\cos\theta)$ potential can be inverted analytically. With
+$u = \cos\theta$ the density is $\propto e^{Cu}$ on $[-1,1]$, so
+\begin{equation}
+  u = \frac{1}{C}\ln\!\left[e^{-C} + Y\left(e^{C}-e^{-C}\right)\right],
+  \qquad Y\sim\mathcal{U}[0,1],
+  \label{eq:angle-sample}
+\end{equation}
+reducing to $u\sim\mathcal{U}[-1,1]$ when $C=0$.
+
+The chain is then built sequentially. The first bond points isotropically. Each
+subsequent bond is constructed in a local frame at polar angle $\theta_i$ from
+the $z$-axis with a uniformly random azimuth, then rotated so that the local
+$z$-axis aligns with the previous bond direction $\uv_{i-1}$; the rotation is the
+Rodrigues matrix taking $\hat{\bm{z}}$ to $\uv_{i-1}$,
+\begin{equation}
+  \bm{R} = \bm{\delta} + [\bm{v}]_\times + [\bm{v}]_\times^{2}\frac{1-c}{\|\bm{v}\|^{2}},
+  \qquad \bm{v} = \hat{\bm{z}}\times\uv_{i-1},
+  \qquad c = \uv_{i-1}\cdot\hat{\bm{z}},
+\end{equation}
+with the degenerate cases $c\to\pm1$ handled separately. Multiplying by the
+sampled length gives $\Q_i$, and bead positions follow by cumulative summation.
+This reproduces bending correlations, unlike an isotropic random walk.
+
+
+% ===========================================================================
+\chapter{Coarse-graining a wormlike chain}
+\label{ch:coarse}
+
+The chapters so far describe a bead--spring chain with given parameters. This one
+is the inverse problem: given a real semiflexible molecule --- a DNA fragment of
+contour length $L$ and persistence length $l_p$ --- choose the spring and bending
+parameters of an $N_s$-spring model that represents it. Everything here is
+implemented in \code{python/bdsim/coarse\_grain.py}.
+
+Units are unimportant as long as they are consistent: $L$ and $l_p$ may be in base
+pairs, nanometres or metres, and only their ratio enters. DNA is quoted below as
+$L = 25\,000$\,bp with $l_p = 147$\,bp (i.e.\ $50$\,nm at $0.34$\,nm per base pair).
+
+\section{Wormlike-chain reference moments}
+\label{sec:wlc-moments}
+
+The target is the Kratky--Porod wormlike chain. Its even end-to-end moments follow
+from the Hamprecht--Kleinert perturbation recursion for the rigid rotator in a
+uniform field; the code carries them for $n = 1,\dots,6$ as reduced moments
+\begin{equation}
+  \langle r^{2n}\rangle = \frac{\langle R^{2n}\rangle}{L^{2n}},
+  \qquad r = R/L,
+  \qquad t = L/l_p .
+\end{equation}
+The lowest is the familiar
+\begin{equation}
+  \langle R^{2}\rangle = 2 l_p L - 2 l_p^{2}\left(1 - e^{-L/l_p}\right).
+  \label{eq:wlc-r2}
+\end{equation}
+Each moment has the closed form
+\begin{equation}
+  \langle r^{2n}\rangle = t^{-2n}\sum_{l=0}^{n} P_{n,l}(t)\,e^{-l(l+1)t/2},
+  \label{eq:wlc-closed}
+\end{equation}
+the exponential rates being the unperturbed rotator levels $e_0(l) = l(l+1)/2$.
+
+\paragraph{Why the closed forms are not used everywhere.} For a stiff chain
+($t\to0$) the $O(1)$ terms of \eqref{eq:wlc-closed} cancel to $O(t^{2n})$, so
+evaluating it in double precision is catastrophically inaccurate: at $t = 10^{-3}$
+the expression for $\langle R^{8}\rangle$ returns exactly $0$ instead of $\sim
+10^{-24}$. The code therefore also stores the Taylor coefficients about $t=0$ and
+switches between the two at $t = 0.8$, where they agree best. The worst-case
+accuracy at the switch is $\sim10^{-13}$ for $n \le 3$, $\sim10^{-11}$ for $n=4$,
+$\sim10^{-7}$ for $n=5$ and $\sim10^{-5}$ for $n=6$.
+
+Both representations are verified against the two limits they must satisfy:
+$\langle r^{2n}\rangle \to 1$ as $t\to0$ (a rigid rod has $R = L$), and the
+Gaussian values $\langle R^{2n}\rangle \to \langle R^{2}\rangle^{n}(2n+1)!!/3^{n}$
+as $t\to\infty$ --- e.g.\ $\langle R^{4}\rangle \to \tfrac{20}{3}(L l_p)^{2}$ and
+$\langle R^{6}\rangle \to \tfrac{280}{9}(L l_p)^{3}$.
+
+\section{Discretising the chain}
+
+Each of the $N_s$ springs stands for a piece of contour of length
+\begin{equation}
+  l_s = \frac{L}{N_s},
+  \qquad
+  N_{\mathrm{K},s} = \frac{l_s}{2 l_p},
+\end{equation}
+$N_{\mathrm{K},s}$ being the number of Kuhn steps it contains. Two conditions fix
+the spring.
+
+\paragraph{(i) The spring is exactly as extensible as the contour it replaces.}
+\begin{equation}
+  \sigma + \delta Q = l_s .
+  \label{eq:cg-extensibility}
+\end{equation}
+
+\paragraph{(ii) It has the right mean-square extension.}
+\begin{equation}
+  \langle Q^{2}\rangle_{\mathrm{FF}} = \langle R^{2}\rangle_{\mathrm{WLC}}(l_s, l_p),
+  \label{eq:cg-secondmoment}
+\end{equation}
+with the left-hand side the second moment of the FENE--Fraenkel equilibrium
+distribution \eqref{eq:ff-eq-dist}. Condition~\eqref{eq:cg-extensibility} removes
+one parameter and \eqref{eq:cg-secondmoment} fixes a second, leaving the shape
+exponent
+\begin{equation}
+  c = \frac{H \delta Q^{2}}{2 \kB T}
+\end{equation}
+to be supplied. The code solves \eqref{eq:cg-secondmoment} for $\sigma$ by
+bisection with $c$ given, and falls back to $\sigma = 0$ (the FENE limit) when no
+positive root exists.
+
+\section{The shape exponent}
+\label{sec:cg-exponent}
+
+In the flexible limit Sunthar and Prakash give
+\begin{equation}
+  H = \frac{\kB T}{\delta Q^{2}}\left(\frac{3 l_s^{2}}{\langle R^{2}\rangle} - 5\right),
+  \qquad\text{i.e.}\qquad
+  c = \frac{1}{2}\left(\frac{3 l_s^{2}}{\langle R^{2}\rangle} - 5\right).
+  \label{eq:cg-c-flexible}
+\end{equation}
+This becomes negative --- unphysical --- once
+\begin{equation}
+  \frac{3 l_s^{2}}{\langle R^{2}\rangle} < 5
+  \quad\Longleftrightarrow\quad
+  \frac{\langle R^{2}\rangle}{l_s^{2}} > \frac{3}{5}
+  \quad\Longleftrightarrow\quad
+  \frac{l_s}{l_p} < 1.772 ,
+  \label{eq:cg-negative}
+\end{equation}
+i.e.\ for stiff segments.
+
+A stiff segment must become \emph{harder}, not softer, so the correction has to
+grow as $l_s/l_p \to 0$. Adding $l_p/l_s$ does that and vanishes in the flexible
+limit, leaving \eqref{eq:cg-c-flexible} intact where it is valid:
+\begin{equation}
+  \boxed{\;
+  c = \frac{1}{2}\left(\frac{3 l_s^{2}}{\langle R^{2}\rangle} - 5\right)
+      + \frac{l_p}{l_s}\;}
+  \label{eq:cg-c}
+\end{equation}
+
+The correction is chosen to act only where it is needed: $l_p/l_s$ diverges as the
+segment becomes stiff and vanishes in the flexible limit, leaving
+\eqref{eq:cg-c-flexible} untouched where it is valid. Without it $c$ would be
+negative for every segment shorter than $1.772\,l_p$.
+
+\section{Converting to simulation units}
+
+The simulation works in Hookean units (Section~\ref{sec:units}), whose length scale
+follows from the spring itself, $l_H = \sqrt{\kB T/H} = \delta Q/\sqrt{2c}$. Hence
+\begin{equation}
+  \boxed{\;
+  \sqrt{b} \;=\; \delta Q_H = \sqrt{2c},
+  \qquad
+  \sigma_H = \frac{\sigma\sqrt{2c}}{\delta Q}\;}
+  \label{eq:cg-hookean}
+\end{equation}
+which are exactly \code{SpringParams::sqrtb} and
+\code{SpringParams::natural\_length}; the reduced natural length the solver uses is
+$q_0 = \sigma_H/\sqrt{b}$. Note that $\delta Q_H^{2} = 2c = b$ recovers the FENE
+$b$ parameter, as it must.
+
+Stiff segments produce large $\sigma_H$ (e.g.\ $\sigma_H \approx 85$, $q_0\approx30$
+for a $294$\,bp fragment with $N_s = 10$). These are numerically demanding springs
+and need a correspondingly small timestep.
+
+\section{Bending stiffness}
+\label{sec:cg-bending}
+
+The bending constant $C$ of \eqref{eq:bending-potential} controls the correlation
+between successive springs. Four choices are implemented, and they answer
+different questions:
+
+\begin{itemize}
+  \item \textbf{\code{saadat}} --- Saadat and Khomami's fit in $\nu = l_s/l_p =
+        2N_{\mathrm{K},s}$,
+        \begin{equation}
+          C = \frac{1 + p_1\nu + p_2\nu^{2}}{\nu + p_3\nu^{2} + p_4\nu^{3}},
+        \end{equation}
+        with $(p_1,\dots,p_4) = (-1.237,\,0.8105,\,-1.0243,\,0.4595)$. Both
+        numerator and denominator have negative discriminant, so $C>0$ for all
+        $\nu>0$. This is the thesis choice.
+  \item \textbf{\code{langevin}} --- match the continuous wormlike-chain tangent
+        correlation exactly, $\langle\cos\theta\rangle = e^{-l_s/l_p}$, inverting
+        the Langevin function \eqref{eq:angle-dist}.
+  \item \textbf{\code{yamakawa}} --- match the \emph{discrete} chain's persistence
+        length, $l_p/l_s = (1+\langle\cos\theta\rangle)/2(1-\langle\cos\theta\rangle)$.
+  \item \textbf{\code{match\_chain}} --- solve for $C$ so that the assembled chain
+        reproduces $\langle R^{2}\rangle_{\mathrm{WLC}}(L, l_p)$; see below.
+\end{itemize}
+The first three agree for $l_s \ll l_p$ and diverge as the segment becomes
+flexible, because they match different things. In particular \code{saadat} is a fit
+to the discretised chain's statistics, not to the local correlation, so its
+$\langle\cos\theta\rangle$ is deliberately \emph{not} $e^{-l_s/l_p}$.
+
+\section{Chain-level fidelity}
+\label{sec:cg-chain}
+
+Matching each segment to its own piece of contour does not make the assembled
+chain reproduce $\langle R^{2}\rangle_{\mathrm{WLC}}(L,l_p)$, because the chain
+value also depends on the angular correlation.
+
+Write the end-to-end vector as the sum of the bonds, $\bm{R} = \sum_\mu\bm{Q}_\mu$,
+and split each bond into its length and direction, $\bm{Q}_\mu = Q_\mu\uv_\mu$
+with $Q_\mu = \|\bm{Q}_\mu\|$ a \emph{scalar}. Then
+\begin{equation}
+  \langle R^{2}\rangle = \sum_\mu \langle Q_\mu^{2}\rangle
+    + 2\sum_{\mu<\nu}\langle \bm{Q}_\mu\cdot\bm{Q}_\nu\rangle .
+\end{equation}
+In this model the bond lengths are drawn independently of each other and of the
+directions, so the cross terms factorise,
+\begin{equation}
+  \langle \bm{Q}_\mu\cdot\bm{Q}_\nu\rangle
+    = \langle Q_\mu\rangle\,\langle Q_\nu\rangle\,\langle \uv_\mu\cdot\uv_\nu\rangle ,
+\end{equation}
+and the directions form a Markov chain: each step decorrelates by the same factor,
+because the azimuthal angle about the previous bond is uniform, so
+$\langle\uv_\mu\cdot\uv_\nu\rangle = c_\theta^{\,|\nu-\mu|}$ with
+$c_\theta = \langle\cos\theta\rangle$. This is the classical freely-rotating-chain
+argument, here carried through with a distributed rather than fixed bond length.
+Summing the geometric series,
+$\sum_{\mu<\nu}c_\theta^{\,\nu-\mu} = \sum_{k=1}^{N_s-1}(N_s-k)c_\theta^{k}
+ = N_s c_\theta/(1-c_\theta) - c_\theta(1-c_\theta^{N_s})/(1-c_\theta)^{2}$,
+gives
+\begin{equation}
+  \langle R^{2}\rangle_{\mathrm{chain}}
+    = N_s\langle Q^{2}\rangle
+    + 2\langle Q\rangle^{2}\left[
+        \frac{N_s\,c_\theta}{1-c_\theta}
+        - \frac{c_\theta\left(1-c_\theta^{N_s}\right)}{(1-c_\theta)^{2}}\right].
+  \label{eq:cg-chain-r2}
+\end{equation}
+For a fixed bond length $b$ this reduces to the textbook freely-rotating-chain
+result $\langle R^{2}\rangle = N_s b^{2}\left[(1+c_\theta)/(1-c_\theta)\right]
+- 2b^{2}c_\theta(1-c_\theta^{N_s})/(1-c_\theta)^{2}$, which is a useful check on
+the algebra.
+
+\paragraph{A note on $\langle Q\rangle$.} Both $\langle Q^{2}\rangle$ and
+$\langle Q\rangle$ here are moments of the scalar bond \emph{length}, not of the
+bond vector --- the mean bond \emph{vector} is of course zero by isotropy. They are
+not interchangeable: the diagonal terms carry the mean square length while the
+cross terms carry the square of the mean length, and
+\begin{equation}
+  \langle Q^{2}\rangle - \langle Q\rangle^{2} = \operatorname{Var}(Q) > 0 ,
+\end{equation}
+so using $\langle Q^{2}\rangle$ in both places overestimates $\langle
+R^{2}\rangle$ by exactly that variance in every cross term. Monte-Carlo sampling
+confirms \eqref{eq:cg-chain-r2} is the closer of the two.
+
+\paragraph{The size error this exposes.} With the \code{saadat} constant, the
+assembled chain misses the wormlike-chain mean-square end-to-end distance by tens
+of percent (Table~\ref{tab:cg-chain}) --- even though every segment is matched
+exactly. \code{match\_chain} inverts \eqref{eq:cg-chain-r2} for $c_\theta$ (which
+increases monotonically with it) and hence for $C$, bringing every case to within
+about $1\%$. The trade-off is explicit: with this two-parameter family one can
+have the correct local correlation or the correct global size, not both.
+
+\begin{table}[ht]
+\centering
+\caption{Monte-Carlo $\langle R^{2}\rangle$ of the coarse-grained chain divided by
+the wormlike-chain target, $l_p = 147$\,bp. Statistical error $\lesssim 0.01$.}
+\label{tab:cg-chain}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$L$ (bp) & $N_s$ & \code{saadat} & \code{match\_chain} \\
+\midrule
+294    & 10 & 0.887 & 1.010 \\
+294    & 30 & 0.953 & 1.000 \\
+1223   & 20 & 0.722 & 1.003 \\
+7003   & 30 & 1.102 & 1.002 \\
+25000  & 30 & 1.023 & 0.996 \\
+25000  & 80 & 1.152 & 0.993 \\
+164000 & 40 & 0.996 & 0.996 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Which moments to fit}
+\label{sec:cg-hk}
+
+Matching $\langle Q^{2}\rangle$ is a choice, not a necessity. Hamprecht and
+Kleinert give a criterion for which moments actually carry information: compare
+each moment with what a \emph{flat} distribution on $r\in[0,1]$ would give,
+$\langle r^{2n}\rangle^{\mathrm{flat}} = 1/(2n+2)$, and take the ratio
+\begin{equation}
+  \Xi(n) = \frac{\langle r^{2n}\rangle}{\langle r^{2n}\rangle^{\mathrm{flat}}}
+         = (2n+2)\,\langle r^{2n}\rangle .
+\end{equation}
+$\Xi$ peaks at some order $n_{\max}$, roughly $4\xi$ with $\xi = l_p/L$, and those
+are the informative moments: the low moments of a stiff chain all sit near $1$ and
+say almost nothing about the shape. If $n_{\max}\le1$ the lowest moments
+$\langle R^{2}\rangle$, $\langle R^{4}\rangle$, $\langle R^{6}\rangle$ are the
+right ones.
+
+Applied at chain level with $l_p = 147$\,bp, every DNA fragment from $239$\,bp
+upwards has $n_{\max}\le1$, confirming that the lowest three moments are the
+correct choice across the whole experimental range; only at $L\approx l_p$ does the
+peak move (to $n=3$).
+
+Applied at \emph{segment} level, where the relevant stiffness is $\xi_s = l_p/l_s$,
+the picture changes, and \code{fit\_spring\_to\_moments} solves for
+$(\sigma, c)$ --- two free parameters, hence exactly two moments --- to reproduce
+the two most informative orders. Table~\ref{tab:cg-moments} shows that fitting the
+informative moments rather than $\langle Q^{2}\rangle$ can change $c$ by an order
+of magnitude, and does so precisely in the stiff regime where the correction of
+Section~\ref{sec:cg-exponent} was doing the work. The method fails, honestly, when
+the required order exceeds the tabulated $n\le6$ (very stiff segments); the moment
+table can be regenerated to higher order from the recursion if needed.
+
+\begin{table}[ht]
+\centering
+\caption{Segment-level two-moment fit against the default scheme, $l_p = 147$\,bp.
+Residuals of the fit are $\sim10^{-15}$.}
+\label{tab:cg-moments}
+\begin{tabular}{@{}rrrrrrrr@{}}
+\toprule
+$L$ & $N_s$ & $l_s/l_p$ & peak $n$ & fitted orders & $\sigma/l_s$ & $c$ (fitted) & $c$ (default) \\
+\midrule
+294    & 10 & 0.20 & 6 & $(5,6)$ & 0.967 & 0.142 & 4.10 \\
+1223   & 20 & 0.42 & 6 & $(5,6)$ & 0.933 & 0.515 & 1.62 \\
+7003   & 30 & 1.59 & 2 & $(2,3)$ & 0.763 & 1.340 & 0.517 \\
+25000  & 30 & 5.67 & 1 & $(1,2)$ & 0.333 & 3.874 & 2.835 \\
+164000 & 40 & 27.9 & 1 & $(1,2)$ & 0.015 & 19.81 & 19.23 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{From moments to a distribution}
+\label{sec:cg-hkdist}
+
+Hamprecht and Kleinert parameterise the end-to-end distribution as
+\begin{equation}
+  P(r) = \frac{\beta}{\mathrm{B}\!\left(\frac{3+k}{\beta},\,m+1\right)}\,
+         r^{k+2}\left(1 - r^{\beta}\right)^{m},
+  \qquad 0\le r\le 1,
+  \label{eq:hk-pdf}
+\end{equation}
+a radial distribution (it already carries the $r^{2}$ Jacobian), whose moments are
+closed-form,
+\begin{equation}
+  \langle r^{2n}\rangle =
+    \frac{\Gamma\!\left(\frac{3+k+2n}{\beta}\right)\,
+          \Gamma\!\left(\frac{3+k}{\beta}+m+1\right)}
+         {\Gamma\!\left(\frac{3+k}{\beta}\right)\,
+          \Gamma\!\left(\frac{3+k+2n}{\beta}+m+1\right)} .
+  \label{eq:hk-moments}
+\end{equation}
+Fitting the three parameters $(k,\beta,m)$ to three moments therefore converts a
+moment list into a closed-form distribution. The code does this by damped Newton
+in $(k, \ln\beta, \ln(m+1))$, a parameterisation that enforces $\beta>0$ and
+$m>-1$ automatically. The same machinery applies to the coarse-grained chain by
+feeding it that chain's Monte-Carlo moments, so model and target can be compared
+as smooth analytic curves rather than histograms. Fitted parameters agree with
+independently tabulated values to four or five significant figures.
+
+Two caveats. The fit is \emph{not unique}: at $L/l_p = 2$ two parameter sets were
+found that both reproduce all three moments to $10^{-14}$ but differ elsewhere in
+the distribution. And it fails for $L/l_p\lesssim1$, which is the paper's own
+point --- there the informative moments are not the lowest three.
+
+
+\section{Capping the spring constant}
+\label{sec:cg-hcap}
+
+Nothing above bounds $H$. As the discretisation is refined the segments become
+stiff and $H$ grows without limit --- at $L = 2000$\,bp it reaches
+$736$\,pN/nm by $N_s = 80$. That is not merely a large number: $H$ sets the time
+unit through $\lambda_H = \zeta/4H$ (Section~\ref{sec:real-units}), so a timestep
+of fixed size in simulation units covers proportionally \emph{fewer real seconds},
+and reaching the chain's relaxation time becomes arbitrarily expensive.
+
+The code therefore accepts a ceiling \code{max\_H}. When it binds, $c$ is pinned to
+the cap, which through $\sigma+\delta Q = l_s$ ties $c$ to $\sigma$ by
+$c = \tfrac12 H_{\max}(l_s-\sigma)^2$, leaving one unknown for the one remaining
+condition --- so \eqref{eq:cg-secondmoment} is \emph{re-solved}, not abandoned.
+
+The trade is cheap in exactly the regime where it bites. Once a segment is much
+shorter than the persistence length its length barely fluctuates, and the chain's
+conformation --- and hence its dynamics --- is governed by the bending potential
+between segments rather than by the springs. Table~\ref{tab:hcap} bears this out:
+capping $H$ by four orders of magnitude moves the mean segment length
+$\sigma/l_s$ in the fourth decimal place, and $\langle Q^2\rangle$ still matches
+the wormlike chain to machine precision. What changes is $\delta Q_H = \sqrt{2c}$,
+the width of the length distribution within an unchanged physical range.
+
+\begin{table}[ht]
+\centering
+\caption{Effect of capping $H$ at $0.05$\,pN/nm, for $L = 2000$\,bp,
+$l_p = 147$\,bp. The second-moment condition is preserved throughout.}
+\label{tab:hcap}
+\begin{tabular}{@{}rrrrrrr@{}}
+\toprule
+ & & \multicolumn{2}{c}{uncapped} & \multicolumn{3}{c}{capped} \\
+\cmidrule(lr){3-4}\cmidrule(lr){5-7}
+$N_s$ & $l_s/l_p$ & $H$ (pN/nm) & $\sigma/l_s$ & $H$ (pN/nm) & $\sigma/l_s$ & $\langle Q^2\rangle$ error \\
+\midrule
+10 & 1.361 & 0.0175 & 0.7781 & --      & 0.7781 & $-1\times10^{-16}$ \\
+20 & 0.680 & 0.499  & 0.8913 & 0.05    & 0.8872 & $+2\times10^{-16}$ \\
+40 & 0.340 & 20.1   & 0.9453 & 0.05    & 0.9436 & $-4\times10^{-16}$ \\
+80 & 0.170 & 736.5  & 0.9723 & 0.05    & 0.9718 & $-2\times10^{-16}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ===========================================================================
+\chapter{Matching the dynamics}
+\label{ch:dynamics}
+
+The coarse-graining of Chapter~\ref{ch:coarse} fixes the chain's \emph{size} and
+says nothing about how fast it moves. A model can therefore have the right
+structure and completely the wrong timescale. This chapter closes that gap: it
+chooses the bead hydrodynamic radius, through $h^{*}$, so the chain reproduces a
+measured diffusivity --- and does so consistently across discretisations, which is
+the difficult part. The implementation is \code{python/bdsim/dynamics.py}.
+
+\section{The Kirkwood hydrodynamic radius}
+
+In the code's units a free bead has $D = 1/4$ (the SDE carries $1/\sqrt2$ on the
+noise, so $\langle\mathrm{d}R^2\rangle = 3\,\mathrm{d}t/2$), and the bead radius is
+$a = \sqrt{\pi}h^{*}$. The Kirkwood approximation to the centre-of-mass
+diffusivity is
+\begin{equation}
+  D_K = \frac{1}{4N^{2}}\left[N + \sum_{\mu\neq\nu}
+        \left\langle \tfrac13\operatorname{tr}\bm{D}_{\mu\nu}\right\rangle\right],
+  \label{eq:kirkwood-D}
+\end{equation}
+and the hydrodynamic radius, defined by $D = a/(4R_H)$ so that a single bead gives
+$R_H = a$, is
+\begin{equation}
+  \boxed{\;
+  R_H = \frac{a N^{2}}
+             {N + \sum_{\mu\neq\nu}\left\langle\tfrac13\operatorname{tr}\bm{D}_{\mu\nu}\right\rangle}\;}
+  \label{eq:kirkwood-RH}
+\end{equation}
+
+The trace collapses usefully. Substituting the RPY weights \eqref{eq:rpy-omegas}
+into $\tfrac13\operatorname{tr}\bm{D}_{\mu\nu} = \omega_1 + \omega_2 r^{2}/3$, the
+dyadic corrections cancel \emph{exactly} in both branches, leaving the Oseen form
+\begin{equation}
+  \tfrac13\operatorname{tr}\bm{D}_{\mu\nu} =
+  \begin{cases}
+    a/r, & r \ge 2a,\\[2pt]
+    1 - r/4a, & r < 2a,
+  \end{cases}
+  \label{eq:rpy-trace}
+\end{equation}
+continuous at $r = 2a$ (both give $\tfrac12$). In the well-separated regime
+\eqref{eq:kirkwood-RH} reduces to the familiar Kirkwood expression
+\begin{equation}
+  \frac{1}{R_H} = \frac{1}{Na} + \frac{1}{N^{2}}\sum_{\mu\neq\nu}
+                  \left\langle\frac{1}{r_{\mu\nu}}\right\rangle,
+  \label{eq:kirkwood-classic}
+\end{equation}
+which is linear in $1/a$ and can be inverted in closed form. The general case is
+solved by bisection, since overlapping beads break that linearity.
+
+\paragraph{Why this makes the problem tractable.} Equation~\eqref{eq:kirkwood-RH}
+depends on the configurations only through $\langle\operatorname{tr}\rangle$ ---
+that is, only on the \emph{static} structure, which Chapter~\ref{ch:coarse} has
+already fixed. So $h^{*}$ follows from a Monte-Carlo average over equilibrium
+configurations, with no dynamics run at all. It is a one-dimensional monotone
+solve with a physical failure mode: as $h^{*}\to\infty$,
+$R_H \to N^{2}/\sum\langle 1/r\rangle$, so a target above that non-draining
+ceiling is unreachable. That is a real statement, not a numerical one --- it means
+the discretisation is too coarse to carry the molecule's friction.
+
+\section{Verification against direct simulation}
+
+Equation~\eqref{eq:kirkwood-D} is exact for free draining ($D = 1/4N$, no
+approximation) and approximate otherwise, so it must be checked. Measuring the
+centre-of-mass diffusivity directly turned out to be a lesson in estimators.
+
+A single-origin mean-square displacement, fitted over the later part of each run,
+gave $18\%$ relative error --- useless for testing a few-percent approximation.
+Accumulating over \emph{all} time origins helped less than expected ($12\%$),
+because displacements at lag $\tau$ overlap: a run of length $T$ contains only
+about $T/\tau$ independent samples however many origins are used. The fix is to
+use \emph{short} lags, which is also the right definition: the Kirkwood formula is
+an equilibrium-averaged instantaneous mobility, i.e.\ the short-time diffusivity,
+and the long-time value is slightly lower. With that, Table~\ref{tab:kirkwood-bd}.
+
+\begin{table}[ht]
+\centering
+\caption{Kirkwood estimate against direct Brownian dynamics, $N = 10$ Hookean
+chain. The $h^{*} = 0$ row is exact and so tests the estimator rather than the
+physics.}
+\label{tab:kirkwood-bd}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$h^{*}$ & $D_K$ & $D$ measured & ratio \\
+\midrule
+0.00 & 0.025000 & $0.025500 \pm 0.00089$ & 1.020 \\
+0.15 & 0.054322 & $0.054395 \pm 0.00191$ & 1.001 \\
+0.30 & 0.081580 & $0.081088 \pm 0.00284$ & 0.994 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Real units}
+\label{sec:real-units}
+
+Matching a diffusivity quoted in simulation units would be meaningless, because
+\emph{both} Hookean units move with the coarse-graining:
+\begin{equation}
+  l_H = \sqrt{\kB T/H}\quad\text{(set by the static fit)},
+  \qquad
+  \lambda_H = \frac{\zeta}{4H},\quad \zeta = 6\pi\eta_s a,\quad a = \sqrt{\pi}h^{*}l_H .
+\end{equation}
+$\lambda_H$ depends on $h^{*}$, so each discretisation counts time in a different
+second. Across $N_s = 5$ to $20$ for a $2$\,kbp fragment $\lambda_H$ spans
+$3.3\times10^{-5}$ to $5.3\times10^{-8}$\,s.
+
+What makes the match well posed is that $R_H$ is a \emph{length}. The chain of
+reasoning is:
+\begin{enumerate}
+  \item the static fit fixes $l_H$ in nanometres, $l_H = \delta Q/\sqrt{2c}$;
+  \item the model's $R_H$ therefore converts to nanometres with no reference to
+        time at all, and this is what is matched;
+  \item Stokes--Einstein then gives the real diffusivity,
+        \begin{equation}
+          D = \frac{\kB T}{6\pi\eta_s R_H},
+          \label{eq:stokes-einstein}
+        \end{equation}
+        so $D$ is matched in $\mathrm{m^2/s}$ the moment $R_H$ is matched in
+        metres, independently of $N_s$;
+  \item $\lambda_H$ in seconds then follows, and converts any simulated time into
+        a real one.
+\end{enumerate}
+Substituting $a = \sqrt{\pi}h^{*}l_H$ and $R_H = a/4D_H$ into
+$D = D_H l_H^{2}/\lambda_H$ reduces it algebraically to
+\eqref{eq:stokes-einstein}; numerically the two routes agree to a ratio of
+$1.0000$, which is the check that the unit bookkeeping is right.
+
+The three conversions needed to interpret any output are
+\begin{equation}
+  l_H \;\text{(length)},
+  \qquad
+  F_H = \sqrt{H\kB T} = \frac{\kB T}{l_H} \;\text{(force)},
+  \qquad
+  \lambda_H \;\text{(time)},
+\end{equation}
+with energies in $\kB T$. Table~\ref{tab:real-units} shows them for a $2$\,kbp fragment.
+
+It is worth being explicit about what is invariant there, since no two of those
+columns cancel on their own. The physical diffusivity is
+\begin{equation}
+  D = D_K\,\frac{l_H^{2}}{\lambda_H},
+\end{equation}
+and across the three rows the three factors change by
+\begin{equation}
+  D_K \;\div\; 2.6,
+  \qquad
+  l_H^{2} \;\div\; 268,
+  \qquad
+  \lambda_H \;\div\; 689,
+\end{equation}
+so that the \emph{combination} $D_K l_H^{2}/\lambda_H$ is unchanged to four
+figures --- $2.6\times268/689 = 1.00$. It has to be: that combination equals
+$\kB T/6\pi\eta_s R_H$ by \eqref{eq:stokes-einstein}, and $R_H$ was matched.
+
+\begin{table}[ht]
+\centering
+\caption{Unit conversions and the resulting physical diffusivity, $L = 2000$\,bp,
+target $R_H = 42.7$\,nm.}
+\label{tab:real-units}
+\begin{tabular}{@{}rrrrrrr@{}}
+\toprule
+$N_s$ & $h^{*}$ & $l_H$ (nm) & $F_H$ (pN) & $\lambda_H$ (s) & $D_K$ (code) & $D$ ($\mu$m$^2$/s) \\
+\midrule
+5  & 0.1234 & 47.04 & 0.0875 & $2.61\times10^{-5}$ & 0.0603 & 5.1179 \\
+10 & 0.2377 & 15.32 & 0.2686 & $1.74\times10^{-6}$ & 0.0378 & 5.1179 \\
+20 & 0.7875 & 2.871 & 1.434  & $3.78\times10^{-8}$ & 0.0235 & 5.1179 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\section{Free draining: matching without hydrodynamic interaction}
+\label{sec:free-draining}
+
+Hydrodynamic interaction dominates the cost of a step --- Table~\ref{tab:hi-cost}
+puts it at forty to sixty times everything else --- so it is useful to be able to
+switch it off for exploratory runs. Doing so changes the matching problem
+completely, and for the better.
+
+With $h^{*} = 0$ the diffusion tensor is the identity, so
+\begin{equation}
+  D = \frac{\kB T}{N\zeta} = \frac{\kB T}{6\pi\eta_s N a},
+\end{equation}
+independent of configuration. Matching a measured diffusivity therefore needs no
+Monte-Carlo sampling and no root find; the bead radius follows in closed form,
+\begin{equation}
+  \boxed{\; a = \frac{R_H}{N} \;}
+  \label{eq:fd-a}
+\end{equation}
+since $R_H = \kB T/6\pi\eta_s D$. Equivalently $R_H = Na$, which is the
+$h^{*}\to0$ limit of \eqref{eq:kirkwood-RH}: with no shielding, the chain's
+friction is simply $N$ times a bead's.
+
+\paragraph{A nominal $h^{*}$.} The simulation is run with $h^{*} = 0$ and never
+builds the RPY tensor. But the bead radius still has to be declared, because it
+fixes the friction and hence the time unit $\lambda_H = \zeta/4H$. So
+\eqref{eq:fd-a} yields a \emph{nominal} $h^{*}$, used only for the unit
+conversions and never passed to the integrator. Running with $h^{*} = 0$ while
+carrying $h^{*}_{\mathrm{nominal}}$ in the bookkeeping is the whole of the trick.
+
+\begin{table}[ht]
+\centering
+\caption{Free-draining matching for $\lambda$-DNA, target $R_H = 328.2$\,nm. The
+diffusivity is exact for every discretisation, with no sampling.}
+\label{tab:free-draining}
+\begin{tabular}{@{}rrrrrrr@{}}
+\toprule
+$N_s$ & $a$ (nm) & $h^{*}_{\mathrm{nom}}$ & $l_H$ (nm) & $\lambda_H$ (s) & $D$ ($\mu$m$^2$/s) & $\tau_1$ (s) \\
+\midrule
+10 & 29.84 & 0.0693 & 242.7 & $2.01\times10^{-3}$ & 0.6654 & 0.0994 \\
+20 & 15.63 & 0.0498 & 177.2 & $5.62\times10^{-4}$ & 0.6654 & 0.1006 \\
+30 & 10.59 & 0.0402 & 148.4 & $2.67\times10^{-4}$ & 0.6654 & 0.1041 \\
+40 & 8.005 & 0.0346 & 130.4 & $1.56\times10^{-4}$ & 0.6654 & 0.1062 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{What is lost.} Only the centre-of-mass motion is constrained by
+\eqref{eq:fd-a}. The internal modes of a free-draining chain follow Rouse rather
+than Zimm dynamics and couple to flow differently, so the rheology is not to be
+trusted.
+
+The longest relaxation time is nonetheless a useful number, and for a free-draining
+Hookean chain it needs no fitted prefactor,
+\begin{equation}
+  \tau_1 = \frac{\lambda_H}{\sin^{2}\!\left(\pi/2N\right)} .
+\end{equation}
+Table~\ref{tab:free-draining} shows it coming out close to
+discretisation-independent, and in the right range for $\lambda$-DNA. The obvious
+worry --- that Rouse $N^{2}$ scaling would inflate it --- does not materialise,
+because $\lambda_H$ shrinks in step ($a = R_H/N$, and $l_H$ falls as the chain is
+refined) and the two nearly cancel. That is a coincidence about $\tau_1$ alone,
+not a reprieve for the rest of the spectrum: use free draining to place a run at a
+sensible Weissenberg number and to shake down a workflow, and measure rheology
+with HI.
+
+\section{Rodlike units}
+\label{sec:rodlike}
+
+Hookean units are built from the spring, $l_H = \sqrt{\kB T/H}$. That is awkward
+for a stiff, nearly rigid spring: $H$ is then large, $l_H$ is far smaller than the
+bond it describes, and every length in the problem comes out as a large number
+($\sigma_H \approx 35$ for a $2$\,kbp fragment at $N_s = 40$). It also makes
+$h^{*}$ hard to read, for the reason given above.
+
+The alternative is to scale lengths by something taken from the chain rather than
+from the spring. Two choices are natural, and the code supports both:
+\begin{equation}
+  l_R = \sigma \quad\text{(the natural length)},
+  \qquad\text{or}\qquad
+  l_R = \sqrt{\langle Q^{2}\rangle} \quad\text{(the r.m.s.\ bond length)}.
+\end{equation}
+The first is undefined for a FENE spring, where $\sigma = 0$; the second is always
+available, and the two coincide as the spring becomes rigid. Time and force follow
+in the usual diffusive way,
+\begin{equation}
+  \lambda_R = \frac{\zeta\, l_R^{2}}{\kB T},
+  \qquad
+  F_R = \frac{\kB T}{l_R},
+\end{equation}
+matching the convention $\lambda^{*}_R = L^{2}\zeta/\kB T$ used for rodlike models,
+with $L$ the rod length.
+
+\subsection{Conversion}
+
+Let $s = l_R/l_H$ be the rodlike length unit expressed in Hookean units --- that
+is, $s = \sigma_H$ or $s = \sqrt{\langle Q^{2}\rangle_H}$, both of which the code
+already has. Since $H = 1$ and $\kB T = 1$ in Hookean units,
+\begin{equation}
+  \frac{\lambda_H}{\lambda_R}
+    = \frac{\zeta/4H}{\zeta l_R^{2}/\kB T}
+    = \frac{\kB T}{4 H l_R^{2}}
+    = \frac{l_H^{2}}{4 l_R^{2}}
+    = \frac{1}{4s^{2}},
+\end{equation}
+the factor $4$ being the one in $\lambda_H = \zeta/4H$. Collecting the three
+scales:
+\begin{equation}
+  \boxed{\;
+  X_R = \frac{X_H}{s} \;\text{(length)},
+  \qquad
+  F_R = s\,F_H \;\text{(force)},
+  \qquad
+  t_R = \frac{t_H}{4s^{2}} \;\text{(time)},
+  \qquad
+  \dot\gamma_R = 4s^{2}\,\dot\gamma_H \;}
+\end{equation}
+with energies still in $\kB T$ and the bending constant $C$ already dimensionless
+and therefore unchanged.
+
+\subsection{Parameters}
+
+The spring parameters transform to
+\begin{equation}
+  H^{*}_R = \frac{H l_R^{2}}{\kB T} = s^{2},
+  \qquad
+  \sigma^{*}_R = \frac{\sigma_H}{s},
+  \qquad
+  \delta Q^{*}_R = \frac{\delta Q_H}{s},
+\end{equation}
+and the hydrodynamic parameter, using $a = \sqrt{\pi}h^{*}l_H$ and the rodlike
+convention $h^{*}_R = 3a/4l_R$, to
+\begin{equation}
+  h^{*}_R = \frac{3\sqrt{\pi}\,h^{*}}{4 s}.
+\end{equation}
+
+Scaling by $\sigma$ gives three identities worth using as checks, all of which the
+implementation satisfies exactly:
+\begin{equation}
+  \sigma^{*}_R = 1,
+  \qquad
+  H^{*}_R = \sigma_H^{2},
+  \qquad
+  \delta Q^{*}_R = \frac{\delta Q_H}{\sigma_H} = \frac{1}{q_0},
+\end{equation}
+the last being the inverse of the reduced natural length the implicit solver works
+with (Chapter~\ref{ch:springs}). For a $2$\,kbp fragment at $N_s = 40$
+($\sigma_H = 35.53$, $\delta Q_H = 2.057$, $q_0 = 17.28$) the two scalings give
+$H^{*}_R = 1262.7$ versus $1265.6$ and $\delta Q^{*}_R = 0.05788$ versus
+$0.05781$ --- indistinguishable, as they must be once the spring is stiff enough
+that $\sigma \simeq \sqrt{\langle Q^{2}\rangle}$.
+
+\section{Experimental calibration for DNA}
+
+The reference scale is Zimm's result for an ideal non-draining coil,
+\begin{equation}
+  D_{\mathrm{Zimm}} = \frac{8}{3\sqrt{6\pi^{3}}}\,
+                      \frac{\kB T}{\eta_s\sqrt{L b}},
+  \qquad b = 2 l_p,
+  \label{eq:zimm}
+\end{equation}
+the prefactor being $0.195510$. Real DNA departs from \eqref{eq:zimm} in both
+directions: short fragments are rod-like and diffuse faster, while long ones are
+swollen by excluded volume and diffuse slower, so $D/D_{\mathrm{Zimm}}$ falls
+below unity and keeps drifting as $L^{1/2-\nu}$ with $\nu\approx0.588$. The code
+tabulates that ratio and interpolates it logarithmically, giving
+\begin{equation}
+  D(L) = D_{\mathrm{Zimm}}(L)\times\left[D/D_{\mathrm{Zimm}}\right](L),
+  \qquad
+  R_H = \frac{\kB T}{6\pi\eta_s D}.
+\end{equation}
+
+\paragraph{Provenance of the table.} The tabulated ratios were read off a
+published figure (dsDNA with excluded volume, fitted by a discrete wormlike chain
+with $b/d = 36$, $d = 2.9$\,nm, against dynamic light scattering, sedimentation
+and single-molecule data). They are good to perhaps a few percent and exist so the
+pipeline runs end to end; every entry point accepts a replacement table. Note also
+that the digitised curve is the one fitting the light-scattering and sedimentation
+data --- single-molecule values sit systematically below it, which the source
+attributes to intercalating dyes. For $\lambda$-DNA this route gives
+$0.665\,\mu$m$^2$/s where single-molecule measurements give $\approx0.47$; the
+difference is the choice of data, not an error.
+
+\begin{table}[ht]
+\centering
+\caption{The calibration across the experimental range, $l_p = 147$\,bp,
+$b = 100$\,nm, water at $298$\,K.}
+\label{tab:dna-calib}
+\begin{tabular}{@{}rrrrrr@{}}
+\toprule
+$L$ (bp) & $L$ ($\mu$m) & $D_{\mathrm{Zimm}}$ & $D/D_{\mathrm{Zimm}}$ & $D$ ($\mu$m$^2$/s) & $R_H$ (nm) \\
+\midrule
+2\,000   & 0.68  & 3.086 & 1.658 & 5.118 & 42.7 \\
+10\,000  & 3.40  & 1.380 & 1.293 & 1.784 & 122.4 \\
+48\,502  & 16.5  & 0.627 & 1.062 & 0.665 & 328 \\
+164\,000 & 55.8  & 0.341 & 0.954 & 0.325 & 672 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{What is and is not discretisation-independent}
+
+$h^{*}$ varies strongly with $N_s$ --- from $0.12$ to $0.79$ in
+Table~\ref{tab:real-units} --- and must, since a chain of few large beads shields
+itself differently from one of many small ones. The physical prediction is what
+should not vary, and $D$ does not.
+
+\paragraph{Large $h^{*}$ is not by itself a warning.} The familiar rule
+$h^{*}\lesssim0.3$ assumes flexible springs, for which $l_H$ is comparable to the
+bond length. Stiff FENE--Fraenkel springs have $l_H \ll \langle Q\rangle$, so
+$h^{*}>1$ can be perfectly physical. The meaningful diagnostic is $a/\langle
+Q\rangle$, the bead radius relative to the bond length; beyond about $0.5$ the
+beads overlap and the RPY tensor is being used outside its intended regime. For
+the cases above it stays between $0.14$ and $0.24$.
+
+\paragraph{A residual drift.} $R_H$ is matched by construction and
+$\langle R^{2}\rangle$ by \code{match\_chain}, but $\langle R_g^{2}\rangle$ is
+not, and it drifts: $R_g/R_H$ falls from $2.10$ to $1.93$ as $N_s$ goes from $5$
+to $40$. Matching one static moment does not fix the shape, so shape-sensitive
+observables retain a discretisation dependence at the ten-percent level. Whether
+the longest relaxation time inherits that drift is the genuine test of this whole
+scheme --- the diffusivity is matched by construction and so proves nothing --- and
+is what \code{validation/validate\_dynamics.py --relax} is for.
+
+% ===========================================================================
+\chapter{Observables}
+\label{ch:observables}
+
+All observables are computed in Python from a configuration $\R$ and, where
+required, the bead forces $\bm{F}$. Let $\bm{r}_c = \frac1N\sum_\nu\bm{r}_\nu$ and
+$\bm{r}'_\nu = \bm{r}_\nu-\bm{r}_c$.
+
+\paragraph{Size measures.}
+\begin{equation}
+  R^{2} = \left\|\bm{r}_N-\bm{r}_1\right\|^{2},
+  \qquad
+  \bm{G} = \frac{1}{N}\sum_\nu \bm{r}'_\nu\bm{r}'_\nu,
+  \qquad
+  R_g^{2} = \operatorname{tr}\bm{G} .
+\end{equation}
+The $x$-stretch reported in comparisons is
+$\max_\nu r_{\nu,x} - \min_\nu r_{\nu,x}$.
+
+\paragraph{Kramers--Kirkwood stress.} The polymer contribution to the stress
+tensor for one chain is
+\begin{equation}
+  \tau_{ij} = \sum_{\nu} r'_{\nu,i}\,F_{\nu,j},
+  \label{eq:kramers}
+\end{equation}
+computed as \code{Rc.T @ F}. Which force is passed determines what the stress is
+attributed to --- the spring force alone, or the total intramolecular force. From
+\eqref{eq:kramers},
+\begin{equation}
+  \eta_p = -\frac{\tau_{xy}}{\dot\gamma},
+  \qquad
+  N_1 = \tau_{xx}-\tau_{yy},
+  \qquad
+  N_2 = \tau_{yy}-\tau_{zz}.
+\end{equation}
+
+\paragraph{The viscometric relaxation time.} The zero-shear polymer viscosity
+defines a relaxation time,
+\begin{equation}
+  \lambda_\eta = \frac{M\,\eta_{p,0}}{c\,N_A\,\kB T} = \frac{\eta_{p,0}}{n\,\kB T},
+  \label{eq:lambda-eta}
+\end{equation}
+with $M$ the molar mass, $c$ the mass concentration and $n = cN_A/M$ the chain
+number density. The concentration cancels, so this is a single-chain property. It
+is exactly what the code reports: the Kramers stress is measured in units of
+$\kB T$, so $-\langle\tau_{xy}\rangle/\dot\gamma$ is already
+$\eta_p/(n\kB T)$, a time in simulation units. In terms of the intrinsic viscosity
+$[\eta] = \eta_{p,0}/(c\eta_s)$, equation~\eqref{eq:lambda-eta} becomes
+$\lambda_\eta = M\eta_s[\eta]/(N_A\kB T)$.
+
+\paragraph{Rouse check, and a factor of two.} $\lambda_\eta$ sums the whole
+relaxation spectrum, not the slowest mode. For a free-draining Hookean chain the
+mode amplitudes decay with $\tau_p = 1/\sin^{2}(p\pi/2N)$ --- this is what the
+end-to-end correlation measures --- but the stress is \emph{quadratic} in the
+amplitudes, so stress correlations decay at twice the rate, with time constant
+$\tau_p/2$. Hence
+\begin{equation}
+  \lambda_\eta = \frac12\sum_{p=1}^{N-1}\frac{1}{\sin^{2}(p\pi/2N)}
+               = \frac{N^{2}-1}{3},
+  \label{eq:rouse-eta}
+\end{equation}
+which tends to $(\pi^{2}/12)\,\tau_1 \approx 0.82\,\tau_1$: \emph{shorter} than the
+slowest mode. Omitting the factor of one half gives $2(N^2-1)/3$ and is wrong by
+exactly two. A direct measurement of a Hookean chain at $N=11$ gives
+$42.5 \pm 2.6$, against $40.0$ from \eqref{eq:rouse-eta} and $80.0$ without the
+factor. The equilibrium validation script uses \eqref{eq:rouse-eta} as an analytic
+target.
+
+
+% ===========================================================================
+\chapter{Force-extension}
+\label{ch:force-extension}
+
+\section{Measuring it, rather than inferring it}
+
+Given the fit of Section~\ref{sec:cg-hkdist} one is tempted to read off a
+force-extension curve. The free energy of a chain whose ends are held a distance
+$R$ apart is $A(R) = -\kB T\ln[P(R)/R^{2}]$ (dividing out the angular Jacobian), so
+$f = \mathrm{d}A/\mathrm{d}R$ gives
+\begin{equation}
+  \frac{f(r) L}{\kB T} = \frac{m\beta r^{\beta-1}}{1-r^{\beta}} - \frac{k}{r} .
+  \label{eq:hk-force}
+\end{equation}
+This has the right Gaussian limit, $f = 3\kB T R/\langle R^{2}\rangle$ when
+$k\to0$, $\beta\to2$.
+
+\paragraph{It should not be trusted quantitatively.} Equation~\eqref{eq:hk-force}
+is a \emph{consequence} of a three-moment fit, and low moments constrain the bulk
+of the distribution, not the $r\to1$ tail that sets the high-force response. Its
+divergence as $r\to1$ has the right form only because that form was built into the
+ansatz \eqref{eq:hk-pdf}, with $m$ fitted to moments that barely see the region.
+The $-k/r$ term likewise makes it meaningless as $r\to0$. It is useful for
+comparing two distributions on equal footing, not for predicting a stretching
+curve.
+
+The honest alternative is to apply the forces and measure the response, which is
+what the external force of Section~\ref{sec:external} is for: equal and opposite
+loads \eqref{eq:stretch} on the two ends, equilibrate, and sample $\langle
+R_z\rangle$. That measurement includes the bending potential, finite
+extensibility, chain discreteness and hydrodynamic interaction, none of which
+\eqref{eq:hk-force} knows about. It is implemented in
+\code{validation/force\_extension.py}.
+
+\paragraph{Equilibration is the trap.} A pulling measurement must be equilibrated
+for several times the longest relaxation time,
+\begin{equation}
+  \lambda_1 = \frac{1}{\sin^{2}\!\left(\pi/2N\right)}
+\end{equation}
+in the code's time unit (the free-draining Hookean value; stiffer springs relax
+faster, so this is a conservative bound). For $N = 11$ this is $\lambda_1\approx49$
+--- and equilibrating for, say, $t = 10$ produces extensions three to ten times
+too small, which looks exactly like a model that is far too stiff. The script
+computes $\lambda_1$ and defaults to $t_{\mathrm{eq}} = 3\lambda_1$,
+$t_{\mathrm{run}} = 6\lambda_1$.
+
+\paragraph{An exact check.} For a Hookean chain every spring carries the full
+applied load, so $\langle R_z\rangle = N_s f$ exactly, independent of $N_s$.
+Measured with $N_s = 10$: ratios to the exact value of $0.956$, $0.975$, $0.984$,
+$0.989$ at $f = 0.25,\,0.5,\,1,\,2$, all within one standard error.
+
+\section{Does the model follow Marko--Siggia?}
+\label{sec:ms}
+
+At low force, yes, and necessarily so: the Marko--Siggia interpolation
+\begin{equation}
+  \frac{f l_p}{\kB T} = \frac{1}{4(1-x)^{2}} - \frac{1}{4} + x,
+  \qquad x = R/L,
+  \label{eq:marko-siggia}
+\end{equation}
+expands to $f l_p/\kB T \simeq 3x/2$, i.e.\ $f = 3\kB T R/\langle
+R^{2}\rangle$ --- the Gaussian result. Any model with the correct $\langle
+R^{2}\rangle$, which \code{match\_chain} enforces, reproduces it.
+
+At high extension, no --- for two independent reasons.
+
+\paragraph{(i) The spring law has the wrong divergence.} The FENE--Fraenkel force
+diverges linearly in the gap to full extension,
+$\bm{F}^{\mathrm{c}}\propto\left[\delta Q - (Q-\sigma)\right]^{-1}$, giving
+$1-x\propto f^{-1}$. The wormlike chain's $1/4(1-x)^{2}$ gives $1-x\propto
+f^{-1/2}$. This is intrinsic to FENE-type springs and no choice of parameters
+fixes it.
+
+\paragraph{(ii) Discretisation truncates the fluctuation spectrum.} The
+$f^{-1/2}$ law comes from equipartition over transverse bending modes down to
+arbitrarily short wavelength. A chain of $N_s$ springs has no modes below $l_s$, so
+once $\sqrt{\kappa/f} < l_s$ the model has run out of fluctuations to pull out. The
+crossover is
+\begin{equation}
+  \frac{f^{*} l_p}{\kB T} \sim \left(\frac{l_p}{l_s}\right)^{2},
+  \label{eq:fstar}
+\end{equation}
+which for $L = 25\,000$\,bp with $N_s = 30$ is only $\approx0.03$: the model
+departs from \eqref{eq:marko-siggia} almost immediately.
+
+Table~\ref{tab:fe} shows both the measured curve and an independent
+semi-analytic calculation (the single spring in the fixed-force ensemble, which
+omits bending). They agree on the essential number and both differ from
+Marko--Siggia in the same direction: the model over-extends, its extension deficit
+falling a decade per decade of force ($f^{-1}$) against Marko--Siggia's factor of
+$3.16$ ($f^{-1/2}$).
+
+\begin{table}[ht]
+\centering
+\caption{Extension deficit $1-x$ for a coarse-grained $25\,000$\,bp fragment.
+``Measured'' is a pulled Brownian-dynamics run including bending; ``calculated''
+is the single-spring fixed-force ensemble without bending.}
+\label{tab:fe}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$f l_p/\kB T$ & measured & calculated & Marko--Siggia \\
+\midrule
+1   & $5.2\times10^{-1}$ & $5.5\times10^{-1}$ & $5.6\times10^{-1}$ \\
+10  & $7.6\times10^{-2}$ & $8.2\times10^{-2}$ & $1.6\times10^{-1}$ \\
+100 & $7.8\times10^{-3}$ & $8.5\times10^{-3}$ & $5.0\times10^{-2}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{What to do if the high-force regime matters.} Use a spring law that has
+the right divergence: the code carries Marko--Siggia (\code{WLC}) and bounded-WLC
+(\code{WLCbounded}) force laws (Table~\ref{tab:force-laws}). The parameters cannot
+simply be carried over, though --- the correct coarse-grained spring law is not the
+underlying wormlike-chain law, and depends on $N_{\mathrm{K},s}$. Alternatively,
+increase $N_s$ until $l_s\sim l_p$, which pushes $f^{*}$ up by
+\eqref{eq:fstar}. For flows that never reach $f^{*}$, the wrong asymptote is
+irrelevant and FENE--Fraenkel is entirely adequate.
+
+
+% ===========================================================================
+\chapter{Error bars for correlated data}
+\label{ch:statistics}
+
+Every number this code produces is a time average over a steady-state trajectory,
+and successive samples of such a trajectory are not independent: a chain remembers
+its configuration for roughly its longest relaxation time. Treating $N$ samples as
+$N$ independent measurements understates the error by $\sqrt{g}$, where $g$ is the
+statistical inefficiency --- often a factor of several, and an order of magnitude
+in bad cases. The tools are in \code{python/bdsim/statistics.py}.
+
+\section{Statistical inefficiency}
+
+Define the normalised autocorrelation function $\rho_k$ of the sampled series. The
+variance of the mean is inflated by
+\begin{equation}
+  g = 1 + 2\sum_{k\ge1}\rho_k,
+  \qquad
+  N_{\mathrm{eff}} = \frac{N}{g},
+  \qquad
+  \mathrm{s.e.} = \frac{\mathrm{std}(x)}{\sqrt{N_{\mathrm{eff}}}} ,
+  \label{eq:stat-ineff}
+\end{equation}
+$g$ being twice the integrated autocorrelation time in units of the sampling
+interval. The sum must be truncated: the tail of $\rho_k$ is pure noise and
+summing it produces a divergent estimate. The code uses Sokal's automatic window
+--- take the smallest $W$ with $W \ge c\,\tau_{\mathrm{int}}(W)$, here $c = 6$.
+
+The simple protocol of sampling once per relaxation time and treating the samples
+as independent is the $g \to$ (sampling interval) limit of the same idea. It is
+correct but wasteful: \eqref{eq:stat-ineff} recovers the information in the
+intervening samples instead.
+
+\section{Blocking}
+
+Flyvbjerg--Petersen blocking provides an independent estimate that assumes nothing
+about the shape of $\rho_k$. Average adjacent pairs repeatedly; the apparent
+standard error rises and then plateaus once blocks exceed the correlation time,
+and the plateau is the answer. The code reports it alongside
+\eqref{eq:stat-ineff} precisely so the two can be compared.
+
+\section{Discarding the transient}
+
+How much of the start to throw away is chosen by maximising the effective sample
+size of what remains (Chodera's rule), trading lost samples against reduced bias.
+This is not cosmetic: retaining a slowly-relaxing transient biases the mean
+\emph{and} inflates the apparent correlation time, so the error bar grows too.
+
+\section{Validation}
+
+The estimators are checked against a process with an exact answer rather than
+against each other. A first-order autoregressive series, $x_{t+1} = \phi x_t +
+\varepsilon_t$, has $\rho_k = \phi^{k}$ and therefore
+\begin{equation}
+  g = \frac{1+\phi}{1-\phi}
+\end{equation}
+exactly. Table~\ref{tab:ar1} compares the estimate with that value, and the
+predicted standard error with the measured scatter of the mean over $400$
+independent realisations.
+
+\begin{table}[ht]
+\centering
+\caption{Estimators against the exact AR(1) result. ``true'' is the empirical
+scatter of the mean over 400 independent runs; ``naive'' ignores correlation.}
+\label{tab:ar1}
+\begin{tabular}{@{}rrrrrrr@{}}
+\toprule
+$\phi$ & $g$ exact & $g$ est. & ratio & s.e.\ true & s.e.\ from $g$ & s.e.\ naive \\
+\midrule
+0.00 & 1.00  & 1.01   & 1.011 & 0.0165 & 0.0169 & 0.0162 \\
+0.50 & 3.00  & 3.01   & 1.004 & 0.0320 & 0.0325 & 0.0183 \\
+0.80 & 9.00  & 9.05   & 1.005 & 0.0775 & 0.0890 & 0.0259 \\
+0.90 & 19.00 & 19.28  & 1.015 & 0.1480 & 0.1454 & 0.0342 \\
+0.95 & 39.00 & 37.21  & 0.954 & 0.3147 & 0.2591 & 0.0463 \\
+0.98 & 99.00 & 102.88 & 1.039 & 0.8151 & 0.8500 & 0.0775 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$g$ is recovered to within a few percent over two orders of magnitude, and the
+naive error is wrong by $\sqrt{g}$ --- a factor of ten at $\phi = 0.98$.
+
+\section{Two levels of averaging, and when to distrust the correction}
+
+An ensemble run has correlated samples \emph{within} each trajectory and genuinely
+independent trajectories. Two estimates are therefore available: the
+autocorrelation-corrected pooled error \eqref{eq:stat-ineff}, and the scatter of
+the per-trajectory means. The second needs no assumptions at all but has only
+$n_{\mathrm{traj}}-1$ degrees of freedom; agreement between them is good evidence
+that both can be trusted.
+
+\paragraph{A silent failure mode.} The autocorrelation estimate is only meaningful
+when each trajectory contains many samples per correlation time. With few samples
+the ACF cannot be measured at all: Sokal's window closes on the first step, $g$
+comes back as $\approx 1$ --- ``uncorrelated'' --- and the error bar is quietly too
+small by $\sqrt{g_{\mathrm{true}}}$. This is not hypothetical; it occurred on the
+first attempt to use the machinery on a viscosity run, where $12$ samples per
+trajectory returned $g = 1.00$ against a correlation time of $78$ code units and a
+sampling interval of $6.7$.
+
+Two guards now fire on that. If a trajectory carries fewer than about $30$
+samples, or if the two error estimates disagree by more than a factor of two, the
+correction is rejected and the assumption-free between-trajectory error is used
+instead. A well-sampled series ($4000$ samples, $\phi = 0.9$) passes both and is
+accepted.
+
+\paragraph{Practical consequence.} A production run needs enough \emph{samples} as
+well as enough \emph{time}. Sampling a window of $1600$ time units at a
+correlation time of $\approx78$ with only $40$ samples gives roughly two samples
+per correlation time --- too few to estimate $g$, so the analysis falls back to the
+weaker estimator. Around twenty samples per correlation time is a reasonable
+target.
+
+% ===========================================================================
+\chapter{Verification}
+\label{ch:verification}
+
+\section{Unit and regression tests}
+
+Thirteen self-contained executables run under \code{ctest}. Besides the
+component tests (RNG stream, config utilities, individual force laws, flow
+interpolation, mobility, bending, EV), three deserve mention.
+
+\begin{itemize}
+  \item \code{test\_direction} asserts the geometric identity underpinning the
+        implicit solve: the updated connector is parallel to $\bm{\Gamma}$.
+  \item \code{test\_integrator\_rouse} reproduces the original Fortran
+        regression to $10^{-6}$, including two chained integrations on one
+        continued RNG stream.
+  \item \code{test\_external\_force} checks the applied-force bookkeeping and
+        then its effect through the integrator. Measuring $\langle Q_z\rangle$
+        directly is noise-limited, but the Hookean dumbbell is \emph{linear}, so
+        two runs driven by the same random stream differ deterministically:
+        differencing at fixed seed cancels the noise entirely and recovers the
+        exact forced extension to six digits ($0.499999$, $1.999997$, $4.999992$
+        for $f = 0.5,\,2,\,5$).
+  \item \code{test\_hi\_stability} guards the failure mode of
+        Sections~\ref{sec:spring-robustness} and~\ref{sec:spectral-bounds}: that
+        the implicit solve keeps bonds finitely extensible for
+        $\gamma$ up to $10^{20}$; that the Chebyshev square root remains finite
+        and satisfies \eqref{eq:fd} on strongly stretched configurations,
+        including the collective-translation mode; and that full FENE--Fraenkel
+        chains with HI in shear remain bounded over thousands of steps with
+        Chebyshev and Cholesky agreeing statistically.
+\end{itemize}
+
+\section{Comparison with the original Fortran}
+\label{sec:fortran-compare}
+
+The port is validated against the legacy Fortran executable at two levels
+(\code{validation/compare\_fortran.py}).
+
+\paragraph{Force kernel --- exact.} The Fortran writes both the configuration and
+its own computed total force at each sample. Feeding those configurations through
+the C\texttt{++} force routine and comparing reproduces the Fortran forces to
+machine precision (worst relative difference $\sim 2\times10^{-16}$ over $10^{3}$
+configurations). This check is independent of the random number stream.
+
+\paragraph{Initial distribution --- distributional.} The $t=0$ bond-length
+distributions of the two codes are compared by a two-sample
+Kolmogorov--Smirnov test, which isolates the initial-configuration sampler from
+the dynamics. They are statistically indistinguishable ($p\approx0.19$ over
+$2\times10^{4}$ bonds).
+
+\paragraph{Dynamics --- statistical.} The Fortran seeds its generator from the
+wall clock, so trajectories cannot be matched one-to-one and only ensemble
+averages are meaningful. Over $\sim500$ trajectories per code, the rheological
+observables ($\eta_p$, $N_1$) agree within one standard error at every sample
+time, and $R^{2}$, $R_g^{2}$ within $0.8$ standard errors. The $x$-stretch, being
+an extreme-value statistic, is the noisiest quantity and shows the largest
+scatter ($1$--$2\sigma$) without indicating a systematic difference.
+
+One bookkeeping detail: the Fortran time loop is inclusive and overshoots by one
+step, so its final sample sits at $T+\dt$ rather than $T$. This is $\sim0.1\%$ of
+the integrated time, far below statistical error, and the comparison script
+reports it explicitly so that it is not mistaken for a physical discrepancy.
+
+% ===========================================================================
+\chapter{Summary of departures from the thesis appendices}
+\label{sec:departures}
+
+\begin{longtable}{@{}p{0.28\textwidth}p{0.32\textwidth}p{0.32\textwidth}@{}}
+\toprule
+Topic & Thesis / legacy Fortran & Current code \\
+\midrule
+\endhead
+Chebyshev spectral bounds
+  & Fixman's two-vector Rayleigh-quotient estimate, Eq.~\eqref{eq:fixman}
+  & $m$-step Lanczos with full re-orthogonalisation, Sturm bisection for extreme
+    Ritz values, outward padding \eqref{eq:padding}, warm-started from the previous
+    step's Ritz vectors (Section~\ref{sec:warm-start}). The Fixman estimate is not
+    a bound and overestimates $\lambda_{\min}$, which caused divergence for
+    stretched chains (Section~\ref{sec:spectral-bounds}). \\
+\addlinespace
+Square-root failure handling
+  & none
+  & fluctuation--dissipation check \eqref{eq:fd} with term growth, then exact
+    Cholesky fallback for that step. \\
+\addlinespace
+Cubic root selection
+  & closed-form root
+  & closed-form root, verified to lie in the physical bracket, with bisection
+    fallback if not; result clamped strictly inside the force singularities
+    (Section~\ref{sec:spring-robustness}). \\
+\addlinespace
+Bounded-WLC lookup tables
+  & adaptive table built at start-up, \code{hunt}/\code{polint} interpolation
+  & not implemented; \code{rtsafe} is called directly each step. \\
+\addlinespace
+Flow field
+  & twelve named flow types plus harmonic traps
+  & a single velocity-gradient tensor $\bm{\kappa}$, constant or linearly
+    interpolated from a table; traps removed. \\
+\addlinespace
+Sampling and output
+  & inside the integrator, NetCDF
+  & owned by the Python driver, which integrates in segments; HDF5. \\
+
+
+\addlinespace
+Bending constant
+  & Saadat--Khomami fit only
+  & that, plus Langevin, Yamakawa and \code{match\_chain}, which matches the
+    chain's $\langle R^2\rangle$ directly (Section~\ref{sec:cg-chain}). \\
+
+\addlinespace
+Spring constant
+  & unbounded
+  & optional ceiling \code{max\_H} with $\sigma$ re-solved
+    (Section~\ref{sec:cg-hcap}); $H$ sets the time unit, so an uncapped $H$ makes
+    reaching the relaxation time arbitrarily expensive. \\
+\addlinespace
+Chain friction
+  & not addressed here
+  & $h^{*}$ solved from the Kirkwood hydrodynamic radius against a measured
+    diffusivity, with the full set of unit conversions
+    (Chapter~\ref{ch:dynamics}). \\
+\addlinespace
+Error bars
+  & scatter between trajectories
+  & autocorrelation-corrected, with blocking and between-trajectory estimates as
+    cross-checks and guards against the case where the correction cannot be
+    estimated (Chapter~\ref{ch:statistics}). \\
+\addlinespace
+External forces
+  & not present
+  & per-bead, constant or time-interpolated (Section~\ref{sec:external}), enabling
+    direct force-extension measurement (Chapter~\ref{ch:force-extension}). \\
+\addlinespace
+Parallelism
+  & MPI across ranks
+  & multiprocessing over trajectories, seeded by index so results are independent
+    of worker count. \\
+\bottomrule
+\end{longtable}
+
+\paragraph{Unchanged.} The SDE \eqref{eq:sde}, the predictor--corrector scheme
+and its $\bm{\Upsilon}$ formulation, all seven spring force laws and their
+implicit equations, the RPY tensor, the bending force
+\eqref{eq:bending-force}, the excluded-volume forms, the \"{O}ttinger noise
+\eqref{eq:ottinger-noise}, the \code{ran\_1} generator, and the
+initial-configuration samplers are all mathematically identical to the thesis and
+the legacy code, and are verified as such where an oracle exists.
+
+\end{document}

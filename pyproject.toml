@@ -1,0 +1,35 @@
+# Editable install of the Python driver package.
+#
+#   pip install -e .        # from this directory (the venv should be active)
+#
+# This makes `import bdsim` work from anywhere -- both when running scripts and
+# for editors/type-checkers (VS Code / Pylance) -- so no sys.path juggling is
+# needed and go-to-definition resolves into python/bdsim/.
+#
+# The compiled core (_bdsim*.so) is still built by CMake (-DBDSIM_PYTHON=ON) and
+# copied into python/bdsim/; this file only packages the Python layer, so a
+# rebuild of the extension does not require reinstalling.
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bdsim"
+version = "0.1.0"
+description = "Brownian dynamics bead-spring simulations (Python driver over the C++ core)"
+requires-python = ">=3.9"
+dependencies = ["numpy", "h5py"]
+
+[project.optional-dependencies]
+build = ["nanobind"]
+
+[tool.setuptools]
+# The package lives under python/ (not the repo root), so point setuptools there.
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.package-data]
+# Ship the compiled extension if it has been built/copied into the package dir.
+bdsim = ["*.so", "*.pyd", "*.pyi"]

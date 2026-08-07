@@ -1,0 +1,33 @@
+# Build output
+build/
+*.o
+*.so
+*.pyd
+*.egg-info/
+__pycache__/
+
+# Environments
+.venv/
+venv/
+
+# Documentation output
+docs/_build/
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/*.pdf
+
+# Fortran reference (SingleChainBD): the compiled binary and its NetCDF output
+# are regenerated, not source. Point validation/compare_fortran.py at your own
+# build -- see fortran_ref/README.md. inputc.dat IS tracked, since it defines
+# the comparison case.
+fortran_ref/sens
+fortran_ref/*.nc
+fortran_ref/*.mod
+
+# Simulation output
+*.h5
+validation/comparison_run/
+validation/*.json
+validation/*.png
