@@ -6,6 +6,7 @@
 #   ./setup.sh                  # everything, into ./.venv
 #   ./setup.sh --native         # add -march=native (faster, not portable)
 #   ./setup.sh --lapack         # use BLAS/LAPACK for the HI dense kernels
+#   ./setup.sh --fortran        # also build the Fortran reference (needs gfortran)
 #   ./setup.sh --no-tests       # skip ctest
 #   ./setup.sh --jobs 4         # limit parallel compile jobs
 #
@@ -18,12 +19,14 @@ cd "$ROOT"
 
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
 RUN_TESTS=1
+WANT_FORTRAN=0
 CMAKE_EXTRA=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --native)   CMAKE_EXTRA+=(-DBDSIM_NATIVE=ON); shift ;;
     --lapack)   CMAKE_EXTRA+=(-DBDSIM_LAPACK=ON); shift ;;
+    --fortran)  WANT_FORTRAN=1; CMAKE_EXTRA+=(-DBDSIM_FORTRAN=ON); shift ;;
     --no-tests) RUN_TESTS=0; shift ;;
     --jobs)     JOBS="$2"; shift 2 ;;
     # the header comment, up to the first line that is not a comment
@@ -51,6 +54,12 @@ fi
 python3 - <<'PY' || die "Python 3.9 or newer is required"
 import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)
 PY
+if [[ $WANT_FORTRAN -eq 1 ]]; then
+  command -v gfortran >/dev/null || die "--fortran needs a Fortran compiler and LAPACK:
+    sudo apt install -y gfortran liblapack-dev     # Debian/Ubuntu/WSL
+    brew install gcc openblas                      # macOS"
+  printf '  gfortran %s\n' "$(gfortran --version | head -1 | awk '{print $NF}')"
+fi
 printf '  cmake   %s\n' "$(cmake --version | head -1 | awk '{print $3}')"
 printf '  python  %s\n' "$(python3 --version | awk '{print $2}')"
 

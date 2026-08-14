@@ -11,16 +11,26 @@ constexpr std::int32_t IA = 16807;
 constexpr std::int32_t IM = 2147483647;   // 2^31 - 1 = 0x7FFFFFFF
 constexpr std::int32_t IQ = 127773;
 constexpr std::int32_t IR = 2836;
+
+// am = nearest(1.0,-1.0)/real(IM), all single precision. nearest(1.0,-1.0) is
+// the largest float strictly below 1.0f; real(IM) rounds to 2147483648.0f.
+//
+// This is a constant, so it is computed once here rather than stored per
+// generator. It used to be a member assigned only inside maybe_init(), which
+// made restore() unusable: a restored state has seed > 0 and iy > 0, so
+// maybe_init() did nothing, am stayed 0, and every subsequent draw was 0.0 --
+// silently, with no error. Keeping it out of the object removes that failure
+// mode entirely.
+float am() {
+    static const float value =
+        std::nextafterf(1.0f, -1.0f) / static_cast<float>(IM);
+    return value;
 }
+}  // namespace
 
 void Rng::maybe_init() {
     // Fortran: If ((seed <= 0) .or. (iy < 0)) Then ... End If
     if (seed_ <= 0 || iy_ < 0) {
-        // am = nearest(1.0,-1.0)/real(IM), all single precision.
-        // nearest(1.0,-1.0) is the largest float strictly below 1.0f;
-        // real(IM) rounds to 2147483648.0f.
-        am_ = std::nextafterf(1.0f, -1.0f) / static_cast<float>(IM);
-
         const std::int32_t s = std::abs(seed_);
         iy_ = (888889999 ^ s) | 1;
         ix_ =  777755555 ^ s;
@@ -53,7 +63,7 @@ void Rng::ran_1(int n, dp* x) {
 
         // X = am * result, computed in single precision (am is float), then
         // widened to double — matching the Fortran mixed-kind expression.
-        x[c] = static_cast<dp>(am_ * static_cast<float>(result));
+        x[c] = static_cast<dp>(am() * static_cast<float>(result));
     }
 
     ix_ = static_cast<std::int32_t>(ux);

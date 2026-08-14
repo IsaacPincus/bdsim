@@ -21,6 +21,7 @@ Trajectories are independent and seeded by index (seed + i), so results do not
 depend on the number of workers. Parallelism is `parallel` (serial / processes).
 """
 import os
+import sys
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -178,7 +179,8 @@ def _simulate_worker(job):
 
 def simulate(phys: PhysParams, sim: SimParams, *, n_traj: int = 1, seed: int = 0,
              n_steps: int = None, initial: Initial = None, output: Output = None,
-             backend: str = "serial", n_workers: int = None):
+             backend: str = "serial", n_workers: int = None,
+             on_error: str = "skip", max_failed_fraction: float = None):
     """Run `n_traj` independent chains and write their snapshots to HDF5.
 
     Steps are `n_steps` (default: implied by sim.time_end/dt). Each trajectory is
@@ -196,10 +198,14 @@ def simulate(phys: PhysParams, sim: SimParams, *, n_traj: int = 1, seed: int = 0
     jobs = [(i, phys, sim, n_steps, output.directory, output.write_every,
              output.write_forces, output.compression, seed + i,
              initial.method, dict(initial.kwargs)) for i in range(n_traj)]
-    files = parallel_map(_simulate_worker, jobs, backend=backend, n_workers=n_workers)
+    files = parallel_map(_simulate_worker, jobs, backend=backend,
+                         n_workers=n_workers, on_error=on_error)
+    files, failed = _drop_failures(files, "trajectories", max_failed_fraction)
 
     manifest = {
-        "n_trajectories": n_traj,
+        "n_trajectories": len(files),
+        "n_trajectories_requested": n_traj,
+        "n_trajectories_failed": len(failed),
         "seed": seed,
         "n_steps": n_steps,
         "dt": float(sim.dt),
@@ -299,6 +305,63 @@ def _viscosity_worker(job):
     return out
 
 
+MAX_FAILED_FRACTION = 0.1
+"""Above this share of failed trajectories an ensemble refuses to return a value.
+
+A trajectory fails when the integrator gives up on it -- in practice the implicit
+corrector stops converging, the chain is thrown apart, and the diffusion tensor
+that follows is no longer positive definite. That trajectory's data is worthless,
+so dropping it is right. But the failures are not random: they happen to the
+most-stretched chains, so discarding many of them biases the ensemble towards the
+well-behaved ones, and the answer would look plausible while being wrong. A high
+failure rate is a statement about `dt` and `implicit_loop_tol`, not about the
+polymer, so past this fraction the run stops instead of reporting a number.
+"""
+
+
+def _drop_failures(results, what, max_fraction=None):
+    """Split `parallel_map` output into successes and failures.
+
+    Reports what failed on stderr, and raises if too many did. Returns the
+    successful results and the list of Failures.
+    """
+    from .parallel import Failure
+    ok = [r for r in results if not isinstance(r, Failure)]
+    bad = [r for r in results if isinstance(r, Failure)]
+    if not bad:
+        return ok, bad
+
+    n = len(results)
+    frac = len(bad) / n
+    seen, lines = set(), []
+    for f in bad:
+        key = f.message.split("(")[0]
+        if key not in seen:
+            seen.add(key)
+            lines.append(f"    trajectory {f.index}: {f.message.splitlines()[0]}")
+
+    print(f"bdsim: {len(bad)} of {n} {what} failed and were dropped "
+          f"({100 * frac:.0f}%). Distinct causes:", file=sys.stderr)
+    for line in lines[:3]:
+        print(line, file=sys.stderr)
+    print("  Look for an earlier corrector non-convergence warning: that is where\n"
+          "  a failing trajectory actually goes wrong. Reducing dt or tightening\n"
+          "  implicit_loop_tol is the usual fix.", file=sys.stderr)
+
+    limit = MAX_FAILED_FRACTION if max_fraction is None else max_fraction
+    if frac > limit:
+        raise RuntimeError(
+            f"{len(bad)} of {n} {what} failed ({100 * frac:.0f}%), above the "
+            f"{100 * limit:.0f}% limit. The survivors are the trajectories that "
+            f"happened not to blow up, so averaging them would bias the result "
+            f"towards well-behaved chains. Reduce dt or tighten "
+            f"implicit_loop_tol; raise bdsim.ensemble.MAX_FAILED_FRACTION (or "
+            f"pass max_failed_fraction) if you really want the partial ensemble.")
+    if not ok:
+        raise RuntimeError(f"every one of the {n} {what} failed")
+    return ok, bad
+
+
 def _stats(values, n):
     arr = np.asarray(values, dtype=float)
     mean = float(arr.mean())
@@ -308,7 +371,8 @@ def _stats(values, n):
 
 def run_ensemble(phys: PhysParams, sim: SimParams, n_traj: int, *, seed: int = 0,
                  n_beads: int = None, properties=("Rsq", "Rg_sq"),
-                 initial: Initial = None, backend="serial", n_workers=None):
+                 initial: Initial = None, backend="serial", n_workers=None,
+                 on_error="skip", max_failed_fraction=None):
     """Run `n_traj` chains and average the named properties.
 
     `initial` is an `Initial` (default: gaussian). Starting from a configuration
@@ -323,15 +387,19 @@ def run_ensemble(phys: PhysParams, sim: SimParams, n_traj: int, *, seed: int = 0
     names = list(properties)
     jobs = [(phys, sim, seed + i, names, initial.method, dict(initial.kwargs))
             for i in range(n_traj)]
-    vals = parallel_map(_ensemble_worker, jobs, backend=backend, n_workers=n_workers)
-    arr = np.array(vals)  # (n_traj, n_props)
-    return {name: _stats(arr[:, k], n_traj) for k, name in enumerate(names)}
+    vals = parallel_map(_ensemble_worker, jobs, backend=backend,
+                        n_workers=n_workers, on_error=on_error)
+    vals, _ = _drop_failures(vals, "trajectories", max_failed_fraction)
+    arr = np.array(vals)  # (n_ok, n_props)
+    n_ok = len(vals)
+    return {name: _stats(arr[:, k], n_ok) for k, name in enumerate(names)}
 
 
 def shear_viscosity(phys: PhysParams, sim: SimParams, rate: float, n_traj: int,
                     sample_times, *, seed: int = 0, n_beads: int = None,
                     initial: Initial = None, variance_reduction: bool = False,
-                    backend="serial", n_workers=None):
+                    backend="serial", n_workers=None,
+                    on_error="skip", max_failed_fraction=None):
     """Steady-state polymer shear viscosity -<tau_xy>/rate over samples and
     trajectories. `phys.flow` must be a shear flow at `rate`. Returns (mean, stderr).
     """
@@ -341,8 +409,10 @@ def shear_viscosity(phys: PhysParams, sim: SimParams, rate: float, n_traj: int,
     st = list(sample_times)
     jobs = [(phys, sim, rate, st, seed + i, initial.method, dict(initial.kwargs),
              variance_reduction) for i in range(n_traj)]
-    series = parallel_map(_viscosity_worker, jobs, backend=backend, n_workers=n_workers)
-    return _stats([float(np.mean(s)) for s in series], n_traj)
+    series = parallel_map(_viscosity_worker, jobs, backend=backend,
+                          n_workers=n_workers, on_error=on_error)
+    series, _ = _drop_failures(series, "trajectories", max_failed_fraction)
+    return _stats([float(np.mean(s)) for s in series], len(series))
 
 
 def _stress_series_worker(job):
@@ -356,7 +426,7 @@ def _stress_series_worker(job):
 
 def stress_series(phys: PhysParams, sim: SimParams, n_traj: int, sample_times, *,
                   seed: int = 0, initial: Initial = None, backend="serial",
-                  n_workers=None):
+                  n_workers=None, on_error="skip", max_failed_fraction=None):
     """Equilibrium tau_xy(t) for `n_traj` chains, as an (n_traj, n_samples) array.
 
     `phys.flow` should be the zero tensor: Green-Kubo extracts the zero-shear
@@ -367,14 +437,17 @@ def stress_series(phys: PhysParams, sim: SimParams, n_traj: int, sample_times, *
     st = list(sample_times)
     jobs = [(phys, sim, st, seed + i, initial.method, dict(initial.kwargs))
             for i in range(n_traj)]
-    return np.asarray(parallel_map(_stress_series_worker, jobs, backend=backend,
-                                   n_workers=n_workers))
+    out = parallel_map(_stress_series_worker, jobs, backend=backend,
+                       n_workers=n_workers, on_error=on_error)
+    out, _ = _drop_failures(out, "trajectories", max_failed_fraction)
+    return np.asarray(out)
 
 
 def shear_viscosity_series(phys: PhysParams, sim: SimParams, rate: float, n_traj: int,
                            sample_times, *, seed: int = 0, n_beads: int = None,
                            initial: Initial = None, variance_reduction: bool = False,
-                           backend="serial", n_workers=None):
+                           backend="serial", n_workers=None,
+                           on_error="skip", max_failed_fraction=None):
     """As `shear_viscosity`, but returns the raw (n_traj, n_samples) array of
     per-sample viscosity contributions.
 
@@ -393,5 +466,7 @@ def shear_viscosity_series(phys: PhysParams, sim: SimParams, rate: float, n_traj
     st = list(sample_times)
     jobs = [(phys, sim, rate, st, seed + i, initial.method, dict(initial.kwargs),
              variance_reduction) for i in range(n_traj)]
-    return np.asarray(parallel_map(_viscosity_worker, jobs, backend=backend,
-                                   n_workers=n_workers))
+    out = parallel_map(_viscosity_worker, jobs, backend=backend,
+                       n_workers=n_workers, on_error=on_error)
+    out, _ = _drop_failures(out, "trajectories", max_failed_fraction)
+    return np.asarray(out)

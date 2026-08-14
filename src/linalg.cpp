@@ -1,8 +1,28 @@
 #include "linalg.hpp"
 
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 namespace bdsim {
+
+namespace {
+// A Cholesky factorisation only exists for a positive-definite matrix. The RPY
+// diffusion tensor is positive definite for any physical configuration, so a
+// non-positive pivot means the configuration itself has already gone wrong --
+// typically two beads driven on top of each other, which makes D numerically
+// singular. Reporting that is far more useful than std::sqrt of a negative
+// number, which returns NaN silently and contaminates everything downstream.
+[[noreturn]] void not_positive_definite(int index, dp pivot) {
+    throw std::runtime_error(
+        "cholesky_lower: matrix is not positive definite (pivot " +
+        std::to_string(index) + " = " + std::to_string(pivot) + "). For the "
+        "RPY tensor this means the configuration is degenerate -- usually two "
+        "beads at essentially the same position after a diverging step. Check "
+        "for an earlier corrector non-convergence warning: that is where the "
+        "trajectory actually failed.");
+}
+}  // namespace
 
 // The dense kernels (matvec / Cholesky / triangular apply / dot) have two
 // backends. The default is hand-rolled and dependency-free. Building with
@@ -36,6 +56,10 @@ Matrix cholesky_lower(const Matrix& M) {
     const int n = M.n;
     int info = 0;
     dpotrf_(&uplo, &n, L.a.data(), &n, &info);
+    // info > 0: the leading minor of that order is not positive definite.
+    if (info > 0) not_positive_definite(info - 1, L(info - 1, info - 1));
+    if (info < 0) throw std::runtime_error(
+        "cholesky_lower: dpotrf rejected argument " + std::to_string(-info));
     return L;
 }
 
@@ -71,8 +95,12 @@ Matrix cholesky_lower(const Matrix& M) {
         for (int j = 0; j <= i; ++j) {
             dp sum = M(i, j);
             for (int k = 0; k < j; ++k) sum -= L(i, k) * L(j, k);
-            if (i == j) L(i, j) = std::sqrt(sum);
-            else        L(i, j) = sum / L(j, j);
+            if (i == j) {
+                if (!(sum > 0.0)) not_positive_definite(i, sum);
+                L(i, j) = std::sqrt(sum);
+            } else {
+                L(i, j) = sum / L(j, j);
+            }
         }
     }
     return L;

@@ -8,9 +8,14 @@
 //   * `am`, the scale factor mapping the 31-bit integer into (0,1), is a
 //     *single precision* real in Fortran. That makes the stream single-precision
 //     granular. We keep `float` here on purpose — do not "upgrade" it.
+//     It is a pure constant and deliberately does NOT live in the object: it
+//     used to be a member set only by the lazy initialiser, so a restored state
+//     (seed > 0, iy > 0) skipped initialisation, left it zero, and the generator
+//     silently returned an all-zero stream. See rng.cpp.
 //   * State (ix, iy, seed) is encapsulated in an object rather than global
 //     module state. reset()/save()/restore() cover the seed-reset and
-//     variance-reduction stream-replay use cases from the Fortran.
+//     variance-reduction stream-replay use cases from the Fortran, and are
+//     what the Python bindings pickle through.
 #pragma once
 
 #include "types.hpp"
@@ -36,6 +41,8 @@ public:
     // Snapshot / restore of the full internal state (get_all_parameters +
     // reset_RNG_with_seed with explicit ix,iy) — used for variance reduction,
     // where two chains must consume an identical random stream.
+    // State is the *whole* mutable state -- a restored generator continues the
+    // saved stream exactly (test_rng checks this round trip).
     struct State { i32 ix, iy, seed; };
     State save() const { return {ix_, iy_, seed_}; }
     void restore(const State& s) { ix_ = s.ix; iy_ = s.iy; seed_ = s.seed; }
@@ -50,7 +57,7 @@ private:
     i32 ix_;
     i32 iy_;
     i32 seed_;
-    float am_ = 0.0f;   // single precision on purpose (see header note)
+    // No `am_` member: it is a constant, not state. See the header note.
 
     void maybe_init();
 };

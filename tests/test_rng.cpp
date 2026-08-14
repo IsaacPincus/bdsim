@@ -63,6 +63,39 @@ int main() {
     std::printf("Test 3 (save/restore replay): %s\n", vr == 0 ? "PASS" : "FAIL");
     failures += vr;
 
+    // ---- Test 4: restore onto a DIFFERENT, never-drawn generator ----
+    // Test 3 restores onto the same object, which has already drawn and so is
+    // already initialised; that hid a bug where the scale factor lived in the
+    // object but was set only by the lazy initialiser. Restoring onto a fresh
+    // generator -- which is what unpickling a Python Rng does -- skipped
+    // initialisation (restored seed > 0, iy > 0) and produced an all-zero
+    // stream, silently. This is the case that matters for variance reduction
+    // and for sending a generator to a worker process.
+    Rng d(10);
+    double warm2[3];
+    d.ran_1(3, warm2);
+    Rng::State snap2 = d.save();
+    double orig[5], copy[5];
+    d.ran_1(5, orig);
+
+    Rng fresh(10);              // never drawn from
+    fresh.restore(snap2);
+    fresh.ran_1(5, copy);
+
+    int cross = 0, zeros = 0;
+    for (int i = 0; i < 5; ++i) {
+        if (orig[i] != copy[i]) ++cross;
+        if (copy[i] == 0.0) ++zeros;
+    }
+    if (cross) {
+        std::printf("  [FAIL] restored stream differs; first: got %.15f want %.15f%s\n",
+                    copy[0], orig[0],
+                    zeros == 5 ? "  (all zeros -- scale factor not initialised)" : "");
+    }
+    std::printf("Test 4 (restore onto a fresh generator): %s\n",
+                cross == 0 ? "PASS" : "FAIL");
+    failures += cross;
+
     std::printf("\n%s\n", failures == 0 ? "ALL RNG TESTS PASSED" : "RNG TESTS FAILED");
     return failures == 0 ? 0 : 1;
 }

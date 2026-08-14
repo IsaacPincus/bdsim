@@ -4,10 +4,43 @@
 #include "mobility.hpp"
 
 #include <cmath>
+#include <cstdio>
 
 namespace bdsim {
 
 namespace {
+
+// Reporting for a corrector that ran out of iterations.
+//
+// This is the point where a trajectory actually fails. The iterate is accepted
+// anyway (so the caller decides what to do), but it is no longer a solution of
+// the implicit step: bonds typically land clamped on the FENE bound, where the
+// spring force is enormous, and the chain is thrown a long way in one step.
+// Any NaN that appears later -- usually from the Cholesky, once two beads have
+// been driven on top of each other -- starts here.
+//
+// The warning is throttled deliberately. Once a chain is wrecked, every
+// subsequent step also fails to converge and runs the full iteration cap, so
+// unthrottled printing both floods the log and makes the run ~100x slower.
+int nonconvergence_count = 0;
+
+void report_nonconvergence(int iters, dp increment, dp tol) {
+    ++nonconvergence_count;
+    const int n = nonconvergence_count;
+    const bool show = n <= 3 || (n <= 1000 && n % 100 == 0) || n % 10000 == 0;
+    if (!show) return;
+    std::fprintf(stderr,
+        "bdsim warning: implicit corrector did not converge after %d iterations "
+        "(final increment %.3e, tolerance %.1e)%s\n",
+        iters, increment, tol,
+        n == 1 ? " -- the step was accepted anyway; this is where the "
+                 "trajectory fails, anything later is a consequence" : "");
+    if (n == 3)
+        std::fprintf(stderr, "bdsim warning: further non-convergence reports "
+                             "will be throttled\n");
+    if (n > 3)
+        std::fprintf(stderr, "               (%d occurrences so far)\n", n);
+}
 
 // Euclidean norm of a bead field (the bond-solve residual measure).
 dp field_norm(const Vec3Field& v) {
@@ -104,7 +137,10 @@ private:
         const Vec3 anchor = R_pred[0];
         Vec3Field R_corr(N), R_prev = R_pred;
 
-        for (int iter = 0; iter <= 100 * N; ++iter) {
+        const int max_iter = 100 * N;
+        dp increment = 0.0;
+        int iter = 0;
+        for (; iter <= max_iter; ++iter) {
             const Vec3Field Fc  = connector_forces(chain_geometry_from_bonds(bond), phys_.spring());
             const Vec3Field DFs = diff.apply(bead_forces_from_connectors(Fc));
 
@@ -117,9 +153,14 @@ private:
                 R_corr[mu + 1] = R_corr[mu] + bond[mu];
             }
 
-            if (field_norm(R_corr - R_prev) / N < sim_.implicit_loop_tol) break;
+            increment = field_norm(R_corr - R_prev) / N;
+            if (increment < sim_.implicit_loop_tol) break;
             R_prev = R_corr;
         }
+        // Falling out of the loop means the fixed point was never reached. The
+        // iterate is returned regardless, but it is not a solution of the step.
+        if (iter > max_iter)
+            report_nonconvergence(max_iter, increment, sim_.implicit_loop_tol);
         return R_corr;
     }
 

@@ -42,7 +42,8 @@ python examples/all_options.py --audit     # every input option, annotated
 ```
 
 `./setup.sh --help` lists the options: `--native` (build with `-march=native`),
-`--lapack` (BLAS/LAPACK for the dense HI kernels), `--no-tests`, `--jobs N`. If
+`--lapack` (BLAS/LAPACK for the dense HI kernels), `--fortran` (also build the
+Fortran reference, see below), `--no-tests`, `--jobs N`. If
 a virtual environment is already active it is used as-is rather than creating
 `.venv`. Re-running is cheap — CMake rebuilds only what changed.
 
@@ -147,6 +148,7 @@ examples/       demo.py, all_options.py
 validation/     Fortran comparison, physics checks, coarse-graining and
                 dynamics validation, viscosity sweeps
 docs/           Sphinx documentation + theory.tex
+fortran/        the original SingleChainBD physics (LAPACK only) + oracle driver
 bench/          integrator timings
 ```
 
@@ -159,10 +161,27 @@ python validation/relaxation_scaling.py --cap 0.05   # relaxation time scaling (
 ./build/bench                                    # timings
 ```
 
-`validation/compare_fortran.py` cross-checks against the Fortran. It needs a
-built `sens` from [SingleChainBD](https://github.com/IsaacPincus/SingleChainBD);
-the binary and its NetCDF output are not tracked here (see
-`fortran_ref/README.md`). Correctness, physics validation and timings are
+### The Fortran reference
+
+The original SingleChainBD physics is vendored in `fortran/` and builds from
+this repository with **LAPACK as its only dependency** -- no MPI, no NetCDF,
+which were needed by the drivers rather than by the physics:
+
+```bash
+sudo apt install gfortran liblapack-dev
+cmake -S . -B build -DBDSIM_FORTRAN=ON -DBDSIM_PYTHON=ON && cmake --build build -j
+python validation/compare_fortran_oracle.py --case full
+```
+
+That runs the same case through both codes at a matched corrector tolerance and
+reports the difference as the tolerance is tightened. See
+[fortran/README.md](fortran/README.md) for what is vendored and why, and for the
+reason the recorded regression tolerance is 1e-6.
+
+`validation/compare_fortran.py` is the older, statistical cross-check against a
+full `sens` ensemble. It needs a built `sens` from
+[SingleChainBD](https://github.com/IsaacPincus/SingleChainBD); the binary and its
+NetCDF output are not tracked here (see `fortran_ref/README.md`). Correctness, physics validation and timings are
 described in [BENCHMARKS.md](BENCHMARKS.md); profiling guidance is in
 [PROFILING.md](PROFILING.md) and parallelism in [PARALLEL.md](PARALLEL.md).
 
