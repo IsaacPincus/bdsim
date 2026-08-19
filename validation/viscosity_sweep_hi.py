@@ -75,12 +75,12 @@ class Config:
 
     # Time stepping and sampling. See the note on stability below: these are
     # deliberately more conservative than the free-draining defaults.
-    dt: float = 0.005
-    implicit_loop_tol: float = 1e-6
+    dt: float = 0.05
+    implicit_loop_tol: float = 1e-4
     eq_taus: float = 3.0                 # equilibration, in units of tau_1
     run_taus: float = 8.0                # production, in units of tau_1
     n_samples: int = 80
-    n_traj: int = 32
+    n_traj: int = 4
 
     variance_reduction: bool = False     # pays below Wi ~ 0.1, hurts above ~0.3
 
