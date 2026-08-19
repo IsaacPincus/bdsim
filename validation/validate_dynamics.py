@@ -32,7 +32,8 @@ Usage:
     python validation/validate_dynamics.py --L 2000 --Ns 5 10 20 40
     python validation/validate_dynamics.py --L 2000 --Ns 5 10 20 --relax
 """
-import argparse, math, sys, pathlib
+import math, sys, pathlib
+from dataclasses import dataclass
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
@@ -89,35 +90,43 @@ def end_to_end_autocorrelation(phys, dt, t_total, n_samples, n_traj, initial,
     return acf / acf[0], np.arange(n) * (t_total / n_samples)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--L", type=float, default=2000.0, help="contour length in bp")
-    ap.add_argument("--Ns", type=int, nargs="+", default=[5, 10, 20, 40])
-    ap.add_argument("--rh-nm", type=float, default=None,
-                    help="experimental hydrodynamic radius in nm (overrides the DNA calibration)")
-    ap.add_argument("--kuhn-nm", type=float, default=dyn.DSDNA_KUHN_NM)
-    ap.add_argument("--temperature", type=float, default=298.15)
-    ap.add_argument("--viscosity", type=float, default=1.0e-3)
-    ap.add_argument("--n-configs", type=int, default=3000)
-    ap.add_argument("--relax", action="store_true", help="also measure the relaxation time")
-    ap.add_argument("--dt", type=float, default=None)
-    ap.add_argument("--n-traj", type=int, default=16)
-    args = ap.parse_args()
+@dataclass
+class Config:
+    """Edit CONFIG below, or call run(Config(...)) from your own script."""
 
-    if args.rh_nm:
-        rh_nm, src = args.rh_nm, "supplied"
+    L: float = 2000.0              # contour length, base pairs
+    Ns: tuple = (5, 10, 20, 40)    # discretisations to compare
+    rh_nm: float = None            # measured hydrodynamic radius; None => DNA calibration
+    kuhn_nm: float = dyn.DSDNA_KUHN_NM
+    temperature: float = 298.15    # K
+    viscosity: float = 1.0e-3      # solvent, Pa s
+    n_configs: int = 3000          # Monte-Carlo configurations for the Kirkwood average
+    relax: bool = False            # also measure the relaxation time (slow)
+    dt: float = None               # None => chosen from the chain
+    n_traj: int = 16
+
+
+CONFIG = Config()
+
+
+def run(cfg: Config = None):
+    """Check that the dynamic matching reproduces the target diffusivity."""
+    cfg = cfg or CONFIG
+
+    if cfg.rh_nm:
+        rh_nm, src = cfg.rh_nm, "supplied"
         D_exp = dyn.experimental_hydrodynamic_radius  # unused; kept for clarity
-        D_exp_val = dyn.KB * args.temperature / (6 * math.pi * args.viscosity * rh_nm * 1e-9)
+        D_exp_val = dyn.KB * cfg.temperature / (6 * math.pi * cfg.viscosity * rh_nm * 1e-9)
     else:
-        D_exp_val = dyn.dna_diffusivity(args.L, args.temperature, args.viscosity,
-                                        args.kuhn_nm, BP_NM)
-        rh_nm = dyn.dna_hydrodynamic_radius_nm(args.L, args.temperature,
-                                               args.viscosity, args.kuhn_nm, BP_NM)
+        D_exp_val = dyn.dna_diffusivity(cfg.L, cfg.temperature, cfg.viscosity,
+                                        cfg.kuhn_nm, BP_NM)
+        rh_nm = dyn.dna_hydrodynamic_radius_nm(cfg.L, cfg.temperature,
+                                               cfg.viscosity, cfg.kuhn_nm, BP_NM)
         src = "dsDNA calibration (Zimm scale x measured D/D_Zimm)"
-    L_um = args.L * BP_NM * 1e-3
-    dz = dyn.zimm_diffusivity(args.L * BP_NM * 1e-9, args.kuhn_nm * 1e-9,
-                              args.temperature, args.viscosity)
-    print(f"L = {args.L:g} bp = {L_um:.4g} um,  lp = {LP_DNA:g} bp,  b = {args.kuhn_nm:g} nm")
+    L_um = cfg.L * BP_NM * 1e-3
+    dz = dyn.zimm_diffusivity(cfg.L * BP_NM * 1e-9, cfg.kuhn_nm * 1e-9,
+                              cfg.temperature, cfg.viscosity)
+    print(f"L = {cfg.L:g} bp = {L_um:.4g} um,  lp = {LP_DNA:g} bp,  b = {cfg.kuhn_nm:g} nm")
     print(f"  D_Zimm       = {dz*1e12:.4g} um^2/s")
     print(f"  D/D_Zimm     = {D_exp_val/dz:.4g}   [{src}]")
     print(f"  D experiment = {D_exp_val*1e12:.4g} um^2/s")
@@ -128,11 +137,11 @@ def main():
     print(f"{'Ns':>4} {'ls/lp':>7} {'l_H (nm)':>9} {'sqrtb':>7} {'C':>7} | {'h*':>8} "
           f"{'a (nm)':>8} {'R_H (nm)':>9}")
     rows = []
-    for Ns in args.Ns:
-        p = cg.spring_parameters(args.L, LP_DNA, Ns, bending="match_chain")
+    for Ns in cfg.Ns:
+        p = cg.spring_parameters(cfg.L, LP_DNA, Ns, bending="match_chain")
         try:
             hstar, info = dyn.hstar_for_target_rh(p, rh_nm, length_unit_nm=BP_NM,
-                                                  n_configs=args.n_configs)
+                                                  n_configs=cfg.n_configs)
         except ValueError as e:
             print(f"{Ns:4d} {p.ls/LP_DNA:7.3f} {p.dQ_H:8.3f} {p.C:8.3f} |  {e}")
             continue
@@ -152,7 +161,7 @@ def main():
     print(f"{'Ns':>4} | {'l_H (nm)':>9} {'F_H (pN)':>9} {'lambda_H (s)':>13} | "
           f"{'D_K (code)':>10} {'D (um^2/s)':>11} {'H (pN/nm)':>10}")
     for Ns, p, hstar, info in rows:
-        u = dyn.physical_units(p, hstar, args.temperature, args.viscosity,
+        u = dyn.physical_units(p, hstar, cfg.temperature, cfg.viscosity,
                                length_unit_nm=BP_NM, hydrodynamic_radius_nm=rh_nm)
         print(f"{Ns:4d} | {u['l_H']*1e9:9.4g} {u['force_H']*1e12:9.4g} "
               f"{u['lambda_H']:13.3e} | {info['D_kirkwood_hookean']:10.5f} "
@@ -186,7 +195,7 @@ def main():
     print("  bond length: beyond ~0.5 the beads overlap and the RPY tensor is being")
     print("  used outside the regime it is meant for.")
 
-    if args.relax and rows:
+    if cfg.relax and rows:
         print(f"\n{'Ns':>4} {'tau_1 (Hookean)':>16} {'tau_1 * D_K / R_H^2':>21}")
         print("  (the dimensionless combination should be Ns-independent if the")
         print("   dynamics are properly matched)")
@@ -196,10 +205,10 @@ def main():
                                      hi_method=bdsim.DelSMethod.Cholesky)
             init = bdsim.Initial("fene_fraenkel_bending",
                                  dict(sigma=p.sigma_H, dQ=p.dQ_H, stiffness=p.C))
-            dt = args.dt or min(1e-3, 0.02 / max(1.0, p.dQ_H ** 2))
+            dt = cfg.dt or min(1e-3, 0.02 / max(1.0, p.dQ_H ** 2))
             lam_guess = dyn_relax_guess(N)
             acf, tt = end_to_end_autocorrelation(phys, dt, 6 * lam_guess, 60,
-                                                 args.n_traj, init)
+                                                 cfg.n_traj, init)
             # integral of the normalised ACF up to its first crossing of 1/e^2
             keep = acf > 0.05
             tau = float(np.trapezoid(acf[keep], tt[keep])) if hasattr(np, "trapezoid") \
@@ -214,4 +223,4 @@ def dyn_relax_guess(n_beads):
 
 
 if __name__ == "__main__":
-    main()
+    run()

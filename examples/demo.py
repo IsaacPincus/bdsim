@@ -86,9 +86,14 @@ def equilibrium_moments():
     sim.time_end, sim.dt = 5.0, 0.05
     sim.implicit_loop_tol = 1e-4
 
-    res = bdsim.run_ensemble(phys, sim, n_traj=2000, seed=1, backend=BACKEND)
+    # run_ensemble reduces each trajectory with a function you choose. final_state
+    # just returns the final configuration; the properties are computed here.
+    Rs = bdsim.run_ensemble(phys, sim, 2000, bdsim.final_state, seed=1,
+                            backend=BACKEND)
     print(f"\nEquilibrium Hookean chain, N={phys.number_of_beads}:")
-    for name, (mean, err) in res.items():
+    for name, prop in (("Rsq", bdsim.end_to_end_sq),
+                       ("Rg_sq", bdsim.radius_of_gyration_sq)):
+        mean, err = bdsim.mean_stderr([prop(R) for R in Rs])
         print(f"  <{name}> = {mean:8.4f} +/- {err:.4f}")
 
 

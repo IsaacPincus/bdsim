@@ -30,8 +30,11 @@ def equilibrium(n, n_traj, seed=1, hstar=0.0, method=None):
     sim.time_end, sim.dt = 8.0, 0.05
     sim.implicit_loop_tol = 1e-4
     # gaussian_chain(bond_std=1) already samples the Hookean equilibrium.
-    return bdsim.run_ensemble(phys, sim, n_traj, seed=seed, n_beads=n,
-                              properties=("Rsq", "Rg_sq"), backend="processes")
+    phys.number_of_beads = n
+    Rs = bdsim.run_ensemble(phys, sim, n_traj, bdsim.final_state, seed=seed,
+                            backend="processes")
+    return {"Rsq":   bdsim.mean_stderr([bdsim.end_to_end_sq(R) for R in Rs]),
+            "Rg_sq": bdsim.mean_stderr([bdsim.radius_of_gyration_sq(R) for R in Rs])}
 
 
 def main():

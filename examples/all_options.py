@@ -204,24 +204,37 @@ output.compression = "gzip"    # default "gzip"; None disables
 #       The core call. The rng stream persists, so consecutive calls continue
 #       seamlessly and segmented stepping equals one continuous run.
 #
-#   run_ensemble(phys, sim, n_traj, *, seed=0, n_beads=None,
-#                properties=("Rsq", "Rg_sq"), initial=None,
-#                backend="serial", n_workers=None) -> {name: (mean, stderr)}
-#       properties are keys of ensemble.PROPERTY_REGISTRY: "Rsq", "Rg_sq".
+#   run_ensemble(phys, sim, n_traj, per_trajectory, *, args=(), seed=0,
+#                initial=None, backend="serial", n_workers=None,
+#                on_error="skip", max_failed_fraction=None) -> list
+#       The whole ensemble layer. `per_trajectory(R0, phys, sim, rng, *args)` is
+#       called once per chain and may return anything. Ready-made ones:
+#           final_state(R0, phys, sim, rng)                   -> final (N,3)
+#           sampled_states(R0, phys, sim, rng, times)         -> list of (N,3)
+#       With backend="processes" your function must be a module-level one, so
+#       that it can be pickled; put anything that varies in `args`.
+#
+#   mean_stderr(values) -> (mean, stderr)      for independent per-trajectory values
 #
 #   simulate(phys, sim, *, n_traj=1, seed=0, n_steps=None, initial=None,
-#            output=None, backend="serial", n_workers=None) -> storage.Run
+#            output=None, backend="serial", n_workers=None,
+#            on_error="skip", max_failed_fraction=None) -> storage.Run
 #       n_steps defaults to the span implied by sim.
 #
-#   shear_viscosity_series(phys, sim, rate, n_traj, sample_times, *, seed=0,
-#                          n_beads=None, initial=None, variance_reduction=False,
-#                          backend="serial", n_workers=None) -> (n_traj, n_samples)
+#   Rheology lives in bdsim.rheology, not in the core run layer:
+#       rheology.shear_viscosity_series(phys, sim, rate, n_traj, times,
+#                                       variance_reduction=False, **kwargs)
+#       rheology.equilibrium_stress_series(phys, sim, n_traj, times, **kwargs)
+#       rheology.shear_viscosity(phys, sim, rate, n_traj, times, **kwargs)
 #       variance_reduction pays below Wi ~ 0.1 and hurts above ~0.3.
-#
-#   stress_series(phys, sim, n_traj, sample_times, ...)      # Green-Kubo input
 #
 #   backend: "serial" or "processes"; n_workers=None uses all cores.
 #   Trajectories are seeded by index, so results never depend on worker count.
+#
+#   Error handling: a trajectory the integrator gives up on is dropped and
+#   reported rather than taking the run down. Past MAX_FAILED_FRACTION (0.1) the
+#   run refuses to return a number, because the survivors are a biased sample.
+#   on_error="raise" restores the old abort-on-first-failure behaviour.
 
 
 # ===========================================================================
@@ -261,9 +274,14 @@ def audit():
                 continue
             if member not in text:
                 missing.append(f"{enum}.{member}")
-    for name in list(bdsim.INITIALIZERS) + list(bdsim.ensemble.PROPERTY_REGISTRY):
+    for name in bdsim.INITIALIZERS:
         if f'"{name}"' not in text:
-            missing.append(f"initialiser/property {name!r}")
+            missing.append(f"initialiser {name!r}")
+    for name in ("shear_viscosity_series", "equilibrium_stress_series",
+                 "shear_viscosity", "viscosity_series", "stress_series",
+                 "viscosity_series_vr"):
+        if name not in text:
+            missing.append(f"bdsim.rheology.{name}")
     if missing:
         print("UNDOCUMENTED OPTIONS (add them to this file):")
         for m in missing:

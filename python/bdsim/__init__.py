@@ -18,7 +18,7 @@ from ._bdsim import (
 )
 
 from . import (flows, initial, properties, ensemble, parallel, storage,
-               coarse_grain, dynamics, statistics)
+               coarse_grain, dynamics, statistics, rheology)
 from .initial import (gaussian_chain, fene_fraenkel_chain, fene_fraenkel_chain_aligned_x,
                       equilibrium_chain, fene_fraenkel_bending_chain,
                       one_minus_cos_theta_angles, isotropic_directions)
@@ -26,12 +26,13 @@ from .properties import (end_to_end_sq, radius_of_gyration_sq, gyration_tensor, 
                          kramers_stress, shear_viscosity as shear_viscosity_config,
                          normal_stress_differences)
 
-# Running: config, the HDF5-writing driver, and the reducing drivers.
+# Running. Two entry points: simulate (trajectories to HDF5) and run_ensemble
+# (trajectories reduced by a function you supply). Rheological measurements are
+# in bdsim.rheology, deliberately not in the core run layer.
 from .statistics import steady_state_stats, trajectory_ensemble_stats, green_kubo
-from .ensemble import (Initial, Output, INITIALIZERS, n_steps_of,
-                       shear_viscosity_series, stress_series,
-                       simulate, trajectory_samples,
-                       run_ensemble, shear_viscosity as shear_viscosity_ensemble)
+from .ensemble import (Initial, Output, INITIALIZERS, n_steps_of, simulate,
+                       run_ensemble, trajectory_samples, final_state,
+                       sampled_states, mean_stderr, MAX_FAILED_FRACTION)
 # Storage: read runs/trajectories back and post-process.
 from .storage import (read_run, read_trajectory, Run, Trajectory,
                       map_property, ensemble_average)
@@ -45,14 +46,14 @@ __all__ = [
     "spring_force", "bending_force", "ev_force", "total_force",
     "flows", "initial", "properties", "ensemble", "parallel", "storage",
     "coarse_grain", "dynamics", "statistics", "spring_parameters",
-    "steady_state_stats", "trajectory_ensemble_stats", "shear_viscosity_series",
-    "stress_series", "green_kubo",
+    "steady_state_stats", "trajectory_ensemble_stats", "green_kubo",
     "gaussian_chain", "fene_fraenkel_chain", "fene_fraenkel_chain_aligned_x",
     "equilibrium_chain", "fene_fraenkel_bending_chain",
     "end_to_end_sq", "radius_of_gyration_sq", "gyration_tensor", "stretch",
     "kramers_stress", "normal_stress_differences",
-    "Initial", "Output", "INITIALIZERS", "n_steps_of",
-    "simulate", "trajectory_samples", "run_ensemble",
+    "Initial", "Output", "INITIALIZERS", "n_steps_of", "rheology",
+    "simulate", "run_ensemble", "trajectory_samples",
+    "final_state", "sampled_states", "mean_stderr", "MAX_FAILED_FRACTION",
     "read_run", "read_trajectory", "Run", "Trajectory",
     "map_property", "ensemble_average", "parallel_map",
 ]

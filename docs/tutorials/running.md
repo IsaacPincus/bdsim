@@ -92,14 +92,32 @@ that a short run measures the relaxation, not the equilibrium.
 
 ## Running an ensemble
 
-For averaged scalars, with no per-step output:
+For averaged scalars, with no per-step output. `run_ensemble` reduces each
+trajectory with a function you supply; `final_state` is the simplest one, and
+the properties are then computed from what it returns:
 
 ```python
-res = bdsim.run_ensemble(phys, sim, n_traj=200, seed=0,
-                         properties=("Rsq", "Rg_sq"),
-                         initial=initial, backend="processes")
-mean, stderr = res["Rsq"]
+Rs = bdsim.run_ensemble(phys, sim, 200, bdsim.final_state, seed=0,
+                        initial=initial, backend="processes")
+mean, stderr = bdsim.mean_stderr([bdsim.end_to_end_sq(R) for R in Rs])
 ```
+
+Anything else you want per trajectory is a function you write:
+
+```python
+# in mymodule.py -- with backend="processes" it must be importable, so that
+# it can be pickled and sent to the workers
+def max_extension(R0, phys, sim, rng):
+    R = bdsim.integrate(R0, phys, sim, rng)
+    return float(np.ptp(R[:, 0]))
+
+vals = bdsim.run_ensemble(phys, sim, 200, mymodule.max_extension,
+                          backend="processes")
+```
+
+A trajectory the integrator gives up on is dropped and reported rather than
+taking the whole run down; past `bdsim.MAX_FAILED_FRACTION` (10%) the call
+raises instead, because the surviving trajectories are a biased sample.
 
 For trajectories written to disk, see [Storage](storage.md).
 
@@ -146,7 +164,7 @@ sim.dt = 0.01
 sim.implicit_loop_tol = 1e-4
 
 samples = np.linspace(3 * tau, 9 * tau, 100)          # after equilibration
-series = bdsim.shear_viscosity_series(
+series = bdsim.rheology.shear_viscosity_series(
     phys, sim, 0.5, n_traj=32, sample_times=samples,
     initial=bdsim.Initial("gaussian"), backend="processes")
 

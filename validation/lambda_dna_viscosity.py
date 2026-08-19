@@ -25,7 +25,8 @@ Usage:
     python validation/lambda_dna_viscosity.py --quick          # pipeline smoke test
     python validation/lambda_dna_viscosity.py --n-traj 64      # production
 """
-import argparse, math, sys, pathlib
+import math, sys, pathlib
+from dataclasses import dataclass
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
@@ -40,21 +41,21 @@ G_PER_MOL_PER_BP = 650.0
 N_A = 6.02214076e23
 
 
-def run_case(L_bp, Ns, rates_per_s, args):
-    kT = dyn.KB * args.temperature
+def run_case(L_bp, Ns, rates_per_s, cfg):
+    kT = dyn.KB * cfg.temperature
 
     # --- static, with the H cap to keep lambda_H (and so the timestep) usable ---
     cap = None
-    if args.max_H_pN_per_nm:
-        cap = args.max_H_pN_per_nm * BP_NM ** 2 / (kT * 1e21)   # pN/nm -> kT/bp^2
+    if cfg.max_H_pN_per_nm:
+        cap = cfg.max_H_pN_per_nm * BP_NM ** 2 / (kT * 1e21)   # pN/nm -> kT/bp^2
     p = cg.spring_parameters(L_bp, LP_DNA, Ns, bending="match_chain", max_H=cap)
 
     # --- dynamic: h* from the measured hydrodynamic radius ---
-    rh_nm = dyn.dna_hydrodynamic_radius_nm(L_bp, args.temperature, args.viscosity,
+    rh_nm = dyn.dna_hydrodynamic_radius_nm(L_bp, cfg.temperature, cfg.viscosity,
                                            length_unit_nm=BP_NM)
     hstar, info = dyn.hstar_for_target_rh(p, rh_nm, length_unit_nm=BP_NM,
-                                          n_configs=args.n_configs)
-    u = dyn.physical_units(p, hstar, args.temperature, args.viscosity,
+                                          n_configs=cfg.n_configs)
+    u = dyn.physical_units(p, hstar, cfg.temperature, cfg.viscosity,
                            length_unit_nm=BP_NM, hydrodynamic_radius_nm=rh_nm)
 
     print(f"\n=== Ns = {Ns} ===")
@@ -71,7 +72,7 @@ def run_case(L_bp, Ns, rates_per_s, args):
                          dict(sigma=p.sigma_H, dQ=p.dQ_H, stiffness=p.C))
 
     sim = bdsim.SimParams()
-    sim.dt = args.dt
+    sim.dt = cfg.dt
     sim.implicit_loop_tol = 1e-4
 
     print(f"\n  {'gd (1/s)':>10} {'gd (code)':>11} {'[eta] (mL/g)':>20} {'Wi':>7} "
@@ -80,15 +81,15 @@ def run_case(L_bp, Ns, rates_per_s, args):
     for gd_real in rates_per_s:
         gd_code = gd_real * u["lambda_H"]
         phys.flow = bdsim.flows.shear(gd_code)
-        samples = np.linspace(args.t_eq, args.t_eq + args.t_run, args.n_samples)
-        series = bdsim.shear_viscosity_series(
-            phys, sim, gd_code, args.n_traj, samples, seed=1,
+        samples = np.linspace(cfg.t_eq, cfg.t_eq + cfg.t_run, cfg.n_samples)
+        series = bdsim.rheology.shear_viscosity_series(
+            phys, sim, gd_code, cfg.n_traj, samples, seed=1,
             initial=init, backend="processes")
         interval = (samples[1] - samples[0]) if len(samples) > 1 else 1.0
         stats, se_between = bdsim.trajectory_ensemble_stats(series, interval)
         m, e = stats.mean, stats.stderr
         eta_over_n = m * kT * u["lambda_H"]          # Pa.s.m^3
-        intrinsic = eta_over_n * N_A / (M_kg_per_mol * args.viscosity) * 1000.0
+        intrinsic = eta_over_n * N_A / (M_kg_per_mol * cfg.viscosity) * 1000.0
         results.append((gd_real, gd_code, m, eta_over_n, intrinsic, stats, se_between))
     lam_eta = results[0][2]                          # eta_p,code at lowest rate = a time
     for gd_real, gd_code, m, eon, intr, stt, seb in results:
@@ -117,9 +118,9 @@ def run_case(L_bp, Ns, rates_per_s, args):
     # rate, or the low-rate points are still relaxing out of their coiled initial
     # state while the high-rate ones have already stretched -- which shows up as
     # spurious shear THICKENING.
-    if args.t_eq < 3.0 * lam_eta:
-        print(f"\n  *** WARNING: t_eq = {args.t_eq:g} is only "
-              f"{args.t_eq/lam_eta:.2f} relaxation times. Use t_eq >~ "
+    if cfg.t_eq < 3.0 * lam_eta:
+        print(f"\n  *** WARNING: t_eq = {cfg.t_eq:g} is only "
+              f"{cfg.t_eq/lam_eta:.2f} relaxation times. Use t_eq >~ "
               f"{3*lam_eta:.0f} and t_run >~ {6*lam_eta:.0f}. Until then the")
         print("      apparent shear-rate dependence is an equilibration artefact,")
         print("      not rheology. ***")
@@ -129,49 +130,52 @@ def run_case(L_bp, Ns, rates_per_s, args):
         print("      solution does not do: treat these numbers as a smoke test. ***")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--L", type=float, default=LAMBDA_DNA_BP)
-    ap.add_argument("--Ns", type=int, nargs="+", default=[30, 40])
-    ap.add_argument("--rates", type=float, nargs="+", default=None,
-                    help="shear rates in s^-1")
-    ap.add_argument("--temperature", type=float, default=298.15)
-    ap.add_argument("--viscosity", type=float, default=1.0e-3)
-    ap.add_argument("--max-H-pN-per-nm", type=float, default=0.05,
-                    help="cap on the spring constant (0 to disable)")
-    ap.add_argument("--n-configs", type=int, default=1500)
-    ap.add_argument("--dt", type=float, default=1e-3)
-    ap.add_argument("--t-eq", type=float, default=800.0)
-    ap.add_argument("--t-run", type=float, default=1600.0)
-    ap.add_argument("--n-samples", type=int, default=40)
-    ap.add_argument("--n-traj", type=int, default=32)
-    ap.add_argument("--quick", action="store_true",
-                    help="tiny run: checks the pipeline, NOT converged")
-    args = ap.parse_args()
+@dataclass
+class Config:
+    """Everything this script needs. Edit CONFIG below, or build your own."""
 
-    if args.quick:
-        args.n_configs, args.dt = 300, 5e-3
-        args.t_eq, args.t_run, args.n_samples, args.n_traj = 40.0, 80.0, 12, 8
+    L: float = LAMBDA_DNA_BP       # contour length, base pairs
+    Ns: tuple = (30, 40)           # springs per chain
+    rates: tuple = None            # shear rates in 1/s; None => a decade around 1/lambda
 
-    print(f"lambda-DNA: L = {args.L:g} bp = {args.L*BP_NM*1e-3:.3g} um, "
-          f"M = {args.L*G_PER_MOL_PER_BP*1e-3:.4g} kg/mol")
-    if args.quick:
-        print("*** --quick: short run, results are NOT converged ***")
+    temperature: float = 298.15    # K
+    viscosity: float = 1.0e-3      # solvent, Pa s
+    max_H_pN_per_nm: float = 0.05  # cap on the spring constant; 0 or None to disable
 
-    rates = args.rates
-    for Ns in args.Ns:
-        # default rates: pick a decade around the estimated relaxation rate
-        if rates is None:
-            p0 = cg.spring_parameters(args.L, LP_DNA, Ns, bending="match_chain")
-            rh = dyn.dna_hydrodynamic_radius_nm(args.L, args.temperature, args.viscosity,
-                                                length_unit_nm=BP_NM)
-            lam_est = 6 * math.pi * args.viscosity * (rh * 1e-9) ** 3 / (
-                dyn.KB * args.temperature)
+    n_configs: int = 1500          # Monte-Carlo configurations for the static check
+    dt: float = 1e-3
+    t_eq: float = 800.0
+    t_run: float = 1600.0
+    n_samples: int = 40
+    n_traj: int = 32
+
+
+CONFIG = Config()
+"""The parameters this script runs with. Edit here, or call run(Config(...))."""
+
+QUICK = Config(n_configs=300, dt=5e-3, t_eq=40.0, t_run=80.0,
+               n_samples=12, n_traj=8)
+"""A tiny configuration that checks the pipeline end to end. NOT converged."""
+
+
+def run(cfg: Config = None):
+    """Measure the viscosity of lambda-DNA at each Ns in `cfg`."""
+    cfg = cfg or CONFIG
+    print(f"lambda-DNA: L = {cfg.L:g} bp = {cfg.L*BP_NM*1e-3:.3g} um, "
+          f"M = {cfg.L*G_PER_MOL_PER_BP*1e-3:.4g} kg/mol")
+
+    for Ns in cfg.Ns:
+        if cfg.rates is None:
+            # a decade around the estimated relaxation rate
+            rh = dyn.dna_hydrodynamic_radius_nm(cfg.L, cfg.temperature,
+                                                cfg.viscosity, length_unit_nm=BP_NM)
+            lam_est = 6 * math.pi * cfg.viscosity * (rh * 1e-9) ** 3 / (
+                dyn.KB * cfg.temperature)
             use = [0.1 / lam_est, 1.0 / lam_est, 10.0 / lam_est]
         else:
-            use = rates
-        run_case(args.L, Ns, use, args)
+            use = list(cfg.rates)
+        run_case(cfg.L, Ns, use, cfg)
 
 
 if __name__ == "__main__":
-    main()
+    run()

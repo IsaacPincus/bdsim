@@ -22,7 +22,8 @@ Three checks, in increasing order of what they exercise:
 
 Usage:  python validation/validate_coarse_graining.py [--bd]
 """
-import argparse, sys, pathlib
+import sys, pathlib
+from dataclasses import dataclass
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
@@ -58,10 +59,10 @@ def bd_chain_R2(p, n_springs, n_traj=64, t_end=None, dt=None):
     # guess relaxes.
     init = bdsim.Initial("fene_fraenkel_bending",
                          dict(sigma=p.sigma_H, dQ=p.dQ_H, stiffness=p.C))
-    res = bdsim.run_ensemble(phys, sim, n_traj=n_traj, seed=1, initial=init,
-                             properties=("Rsq",), backend="processes")
+    Rs = bdsim.run_ensemble(phys, sim, n_traj, bdsim.final_state, seed=1,
+                            initial=init, backend="processes")
     lH = p.dQ / p.dQ_H
-    m, e = res["Rsq"]
+    m, e = bdsim.mean_stderr([bdsim.end_to_end_sq(R) for R in Rs])
     return m * lH ** 2, e * lH ** 2
 
 
@@ -131,14 +132,21 @@ def make_plots(cases, bending="match_chain", path="validation/coarse_graining.pn
     print(f"saved {path}")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bd", action="store_true", help="also run short BD checks (slow)")
-    ap.add_argument("--plots", action="store_true",
-                    help="write distribution + force-extension figures")
-    ap.add_argument("--chains", type=int, default=10000,
-                    help="Monte-Carlo chains per case for the figures")
-    args = ap.parse_args()
+@dataclass
+class Config:
+    """Edit CONFIG below, or call run(Config(...)) from your own script."""
+
+    bd: bool = False        # also run short Brownian-dynamics checks (slow)
+    plots: bool = False     # write distribution + force-extension figures
+    chains: int = 10000     # Monte-Carlo chains per case, for the figures
+
+
+CONFIG = Config()
+
+
+def run(cfg: Config = None):
+    """Check the coarse-graining at segment level, chain level and (optionally) BD."""
+    cfg = cfg or CONFIG
 
     print("1. SEGMENT LEVEL  (<Q^2> is fitted; <Q^4> is a free prediction)")
     print(f"{'L(bp)':>8} {'Ns':>4} {'N_K,s':>7} {'branch':>14} "
@@ -159,7 +167,7 @@ def main():
         print(f"{L:8d} {Ns:4d} | {ma/a.R2_chain_target:9.4f} +/- {ea/a.R2_chain_target:6.4f}"
               f" | {mb/b.R2_chain_target:9.4f} +/- {eb/b.R2_chain_target:6.4f}")
 
-    if args.bd:
+    if cfg.bd:
         print("\n3. CHAIN LEVEL, Brownian dynamics (equilibrium, free-draining)")
         print(f"{'L(bp)':>8} {'Ns':>4} {'BD/WLC':>10} {'MC/WLC':>10}")
         for L, Ns in [(25000, 30), (7003, 30), (294, 10)]:
@@ -170,10 +178,10 @@ def main():
                   f"{mm/p.R2_chain_target:10.4f}")
 
 
-    if args.plots:
+    if cfg.plots:
         print()
-        make_plots([(294, 30), (7003, 30), (25000, 30)], n_chains=args.chains)
+        make_plots([(294, 30), (7003, 30), (25000, 30)], n_chains=cfg.chains)
 
 
 if __name__ == "__main__":
-    main()
+    run()

@@ -11,13 +11,23 @@ Shear rates are set by Weissenberg number using the free-draining longest
 relaxation time, which is known in closed form, so the same Wi means the same
 degree of stretching at every L and Ns and the curves are comparable.
 
-Results accumulate in a JSON file, so the sweep can be run in pieces:
+All the parameters live in `CONFIG` below. Edit it and run the file:
 
-    python validation/viscosity_sweep.py --L 2000  --out sweep.json
-    python validation/viscosity_sweep.py --L 10000 --out sweep.json
-    python validation/viscosity_sweep.py --plot sweep.json
+    python validation/viscosity_sweep.py
+
+or drive it from your own script, which is the point of the Config object:
+
+    from viscosity_sweep import Config, run, plot
+    run(Config(L=(2000.0, 10000.0), Ns=(20, 30), n_traj=200,
+               out="my_sweep.json"))
+    plot("my_sweep.json", xkey="wi_eta")
+
+Results accumulate in the JSON file and each (L, Ns) pair is replaced when re-run,
+so a long sweep can be done in pieces.
 """
-import argparse, json, math, os, sys, pathlib
+import json, math, os, sys, pathlib
+from dataclasses import dataclass, field
+
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
@@ -27,21 +37,21 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
 LP_DNA, BP_NM, G_PER_MOL_PER_BP, N_A = 147.0, 0.34, 650.0, 6.02214076e23
 
 
-def one_case(L_bp, Ns, wi_list, args):
+def one_case(L_bp, Ns, wi_list, cfg):
     import bdsim
     from bdsim import coarse_grain as cg
     from bdsim import dynamics as dyn
 
-    kT = dyn.KB * args.temperature
-    cap = (args.max_H_pN_per_nm * BP_NM ** 2 / (kT * 1e21)
-           if args.max_H_pN_per_nm else None)
+    kT = dyn.KB * cfg.temperature
+    cap = (cfg.max_H_pN_per_nm * BP_NM ** 2 / (kT * 1e21)
+           if cfg.max_H_pN_per_nm else None)
     p = cg.spring_parameters(L_bp, LP_DNA, Ns, bending="match_chain", max_H=cap)
 
-    rh_nm = dyn.dna_hydrodynamic_radius_nm(L_bp, args.temperature, args.viscosity,
+    rh_nm = dyn.dna_hydrodynamic_radius_nm(L_bp, cfg.temperature, cfg.viscosity,
                                            length_unit_nm=BP_NM)
-    hs_nom, info = dyn.free_draining_units(p, rh_nm, args.temperature,
-                                           args.viscosity, BP_NM)
-    u = dyn.physical_units(p, hs_nom, args.temperature, args.viscosity,
+    hs_nom, info = dyn.free_draining_units(p, rh_nm, cfg.temperature,
+                                           cfg.viscosity, BP_NM)
+    u = dyn.physical_units(p, hs_nom, cfg.temperature, cfg.viscosity,
                            length_unit_nm=BP_NM, hydrodynamic_radius_nm=rh_nm)
     tau1_s, tau1_code = dyn.free_draining_relaxation_time(p, u)
 
@@ -49,10 +59,10 @@ def one_case(L_bp, Ns, wi_list, args):
     phys = cg.to_phys_params(p, hstar=0.0)
     init = bdsim.Initial("fene_fraenkel_bending",
                          dict(sigma=p.sigma_H, dQ=p.dQ_H, stiffness=p.C))
-    sim = bdsim.SimParams(); sim.dt = args.dt; sim.implicit_loop_tol = 1e-4
+    sim = bdsim.SimParams(); sim.dt = cfg.dt; sim.implicit_loop_tol = 1e-4
 
     M_kg = L_bp * G_PER_MOL_PER_BP * 1e-3
-    if args.variance_reduction and max(wi_list) > 0.3:
+    if cfg.variance_reduction and max(wi_list) > 0.3:
         print("  note: variance reduction is being used above Wi ~ 0.3, where it "
               "costs more than it saves", flush=True)
     print(f"  L={L_bp:g} Ns={Ns}: ls/lp={p.ls/LP_DNA:.2f} sqrtb={p.dQ_H:.3g} "
@@ -63,18 +73,18 @@ def one_case(L_bp, Ns, wi_list, args):
     for wi in wi_list:
         gd_code = wi / tau1_code
         phys.flow = bdsim.flows.shear(gd_code)
-        t_eq, t_run = args.eq_taus * tau1_code, args.run_taus * tau1_code
-        samples = np.linspace(t_eq, t_eq + t_run, args.n_samples)
-        series = bdsim.shear_viscosity_series(
-            phys, sim, gd_code, args.n_traj, samples, seed=1, initial=init,
-            variance_reduction=args.variance_reduction, backend="processes")
+        t_eq, t_run = cfg.eq_taus * tau1_code, cfg.run_taus * tau1_code
+        samples = np.linspace(t_eq, t_eq + t_run, cfg.n_samples)
+        series = bdsim.rheology.shear_viscosity_series(
+            phys, sim, gd_code, cfg.n_traj, samples, seed=1, initial=init,
+            variance_reduction=cfg.variance_reduction, backend="processes")
         interval = samples[1] - samples[0]
         stats, se_between = bdsim.trajectory_ensemble_stats(series, interval)
         # Convert stress -> intrinsic viscosity. The factor is positive and
         # independent of the measurement, so the error transforms with it; do NOT
         # reconstruct the error bar as (value x relative error), because the value
         # itself can come out negative when the run is noise-dominated.
-        to_intrinsic = kT * u["lambda_H"] * N_A / (M_kg * args.viscosity) * 1000.0
+        to_intrinsic = kT * u["lambda_H"] * N_A / (M_kg * cfg.viscosity) * 1000.0
         eta_over_n = stats.mean * kT * u["lambda_H"]
         intr = stats.mean * to_intrinsic
         intr_err = abs(stats.stderr * to_intrinsic)
@@ -282,11 +292,13 @@ def summarise(records):
               + (f"\n      {r['zero_shear_note']}" if r.get("zero_shear_note") else ""))
 
 
-def make_plot(records, path, xkey="wi"):
+def make_plot(records, path, xkey="wi", title=None):
     """Plot a sweep. xkey selects the abscissa:
 
       "wi"      Wi = gammadot * tau_1, the longest relaxation time (default)
       "wi_eta"  Wi = gammadot * lambda_eta,0, the ZERO-SHEAR viscometric time
+
+    `title` overrides the figure heading (the HI sweep passes its own).
 
     Both are a constant per curve, so the choice rescales each curve rigidly.
     """
@@ -344,88 +356,100 @@ def make_plot(records, path, xkey="wi"):
     ax[2].set_xlabel(xlab); ax[2].set_ylabel(r"$\lambda_\eta$ (s)")
     ax[2].set_title(r"$\eta_p(\dot\gamma)/(nk_BT)$; dotted: $\lambda_{\eta,0}$")
     ax[2].grid(alpha=0.3)
-    fig.suptitle("Free-draining DNA, dynamics matched (indicative, not quantitative)")
+    fig.suptitle(title or
+                 "Free-draining DNA, dynamics matched (indicative, not quantitative)")
     fig.tight_layout(); fig.savefig(path, dpi=120)
     print(f"saved {path}")
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\
-List arguments are space-separated -- no brackets, no commas:
+@dataclass
+class Config:
+    """Everything the sweep needs. Edit CONFIG below, or build your own."""
 
-  # two DNA lengths, both discretisations, the default Wi values
-  python validation/viscosity_sweep.py --L 45000 165000 --out sweep.json --n-traj 500
+    # What to sweep.
+    L: tuple = (48502.0,)          # DNA contour lengths, base pairs
+    Ns: tuple = (20, 30)           # springs per chain
+    wi: tuple = (0.3, 1.0, 3.0, 10.0)   # Weissenberg numbers
 
-  # one length, one discretisation, chosen shear rates
-  python validation/viscosity_sweep.py --L 48502 --Ns 30 --wi 1 3 10 30
+    # Where results go. Records accumulate, and each (L, Ns) pair is replaced
+    # when re-run, so a long sweep can be done in pieces.
+    out: str = "validation/viscosity_sweep.json"
 
-  # near-equilibrium, where variance reduction pays
-  python validation/viscosity_sweep.py --L 48502 --wi 0.03 0.1 --variance-reduction
+    # Physical conditions.
+    temperature: float = 298.15    # K
+    viscosity: float = 1.0e-3      # solvent, Pa s
+    max_H_pN_per_nm: float = 0.05  # cap on the spring constant; None for no cap
 
-  # re-plot an existing sweep, deriving lambda_eta and the rest from what is
-  # already stored -- no re-run, and no compiled extension needed
-  python validation/viscosity_sweep.py --plot sweep.json
+    # Time stepping and sampling.
+    dt: float = 0.01
+    eq_taus: float = 3.0           # equilibration, in units of tau_1
+    run_taus: float = 8.0          # production, in units of tau_1
+    n_samples: int = 80
+    n_traj: int = 8
 
-Results accumulate in the JSON, and each (L, Ns) pair is replaced when re-run, so a
-long sweep can be done in pieces.""")
-    ap.add_argument("--L", type=float, nargs="+", default=None)
-    ap.add_argument("--Ns", type=int, nargs="+", default=[20, 30])
-    ap.add_argument("--wi", type=float, nargs="+", default=[0.3, 1.0, 3.0, 10.0])
-    ap.add_argument("--out", default="validation/viscosity_sweep.json")
-    ap.add_argument("--plot", default=None, help="plot an existing JSON and exit")
-    ap.add_argument("--x", choices=["wi", "wi_eta"], default="wi",
-                    help="abscissa: wi = gammadot*tau_1 (default), or wi_eta = "
-                         "gammadot*lambda_eta,0, the zero-shear viscometric time "
-                         "extrapolated per (L, Ns)")
-    ap.add_argument("--temperature", type=float, default=298.15)
-    ap.add_argument("--viscosity", type=float, default=1.0e-3)
-    ap.add_argument("--max-H-pN-per-nm", type=float, default=0.05)
-    ap.add_argument("--dt", type=float, default=0.01)
-    ap.add_argument("--eq-taus", type=float, default=3.0)
-    ap.add_argument("--run-taus", type=float, default=8.0)
-    ap.add_argument("--n-samples", type=int, default=80)
-    ap.add_argument("--n-traj", type=int, default=8)
-    ap.add_argument("--variance-reduction", action="store_true",
-                    help="pair each run with an equilibrium one on the same random "
-                         "stream and subtract; worth it below Wi ~ 0.1, harmful above ~0.3")
-    args = ap.parse_args()
+    # Pair each run with an equilibrium one on the same random stream and
+    # subtract. Worth it below Wi ~ 0.1, harmful above ~0.3.
+    variance_reduction: bool = False
 
-    if args.plot:
-        recs = json.load(open(args.plot))
-        summarise(recs)
-        print()
-        make_plot(recs, os.path.splitext(args.plot)[0] + ".png", xkey=args.x)
-        return
-    if not args.L:
-        ap.error("give --L, or --plot to render an existing sweep")
+    # Plotting: "wi" = gammadot*tau_1, "wi_eta" = gammadot*lambda_eta,0.
+    x: str = "wi"
 
-    recs = json.load(open(args.out)) if os.path.exists(args.out) else []
-    n_points = len(args.L) * len(args.Ns) * len(args.wi)
-    print(f"plan: {len(args.L)} length(s) x {len(args.Ns)} discretisation(s) x "
-          f"{len(args.wi)} shear rate(s) = {n_points} points, "
-          f"{args.n_traj} trajectories each")
-    if min(args.wi) < 0.3 and not args.variance_reduction:
-        print("      note: Wi < 0.3 is noise-dominated without --variance-reduction")
+
+CONFIG = Config()
+"""The parameters this script runs with. Edit here, then `python viscosity_sweep.py`,
+or import and call `run(Config(...))` from your own script."""
+
+
+def run(cfg: Config = None):
+    """Run the sweep described by `cfg`, appending to its JSON file.
+
+    Returns the full list of records (the ones just computed plus any already in
+    the file). Safe to interrupt: the JSON is rewritten after each (L, Ns).
+    """
+    import time
+    cfg = cfg or CONFIG
+
+    recs = json.load(open(cfg.out)) if os.path.exists(cfg.out) else []
+    n_points = len(cfg.L) * len(cfg.Ns) * len(cfg.wi)
+    print(f"plan: {len(cfg.L)} length(s) x {len(cfg.Ns)} discretisation(s) x "
+          f"{len(cfg.wi)} shear rate(s) = {n_points} points, "
+          f"{cfg.n_traj} trajectories each")
+    if min(cfg.wi) < 0.3 and not cfg.variance_reduction:
+        print("      note: Wi < 0.3 is noise-dominated without variance_reduction")
     print()
 
-    import time
     done, t_start = 0, time.time()
-    for L in args.L:
-        for Ns in args.Ns:
+    for L in cfg.L:
+        for Ns in cfg.Ns:
             recs = [r for r in recs if not (r["L"] == L and r["Ns"] == Ns)]
-            recs += one_case(L, Ns, args.wi, args)
-            json.dump(recs, open(args.out, "w"), indent=1)
-            done += len(args.wi)
+            recs += one_case(L, Ns, list(cfg.wi), cfg)
+            json.dump(recs, open(cfg.out, "w"), indent=1)
+            done += len(cfg.wi)
             elapsed = time.time() - t_start
             if done < n_points:
                 eta = elapsed / done * (n_points - done)
                 print(f"    [{done}/{n_points} points, {elapsed/60:.1f} min elapsed, "
                       f"~{eta/60:.0f} min remaining]\n", flush=True)
-    print(f"\n{len(recs)} records -> {args.out}  "
+    print(f"\n{len(recs)} records -> {cfg.out}  "
           f"({(time.time()-t_start)/60:.1f} min)")
+    return recs
+
+
+def plot(path: str = None, xkey: str = None):
+    """Summarise and plot an existing sweep. No simulation, no compiled extension.
+
+    Everything derivable is reconstructed from what is stored, so this works on
+    records written before a given field existed.
+    """
+    path = path or CONFIG.out
+    xkey = xkey or CONFIG.x
+    recs = json.load(open(path))
+    summarise(recs)
+    print()
+    make_plot(recs, os.path.splitext(path)[0] + ".png", xkey=xkey)
+    return recs
 
 
 if __name__ == "__main__":
-    main()
+    run()
+    plot()

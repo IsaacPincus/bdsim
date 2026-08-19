@@ -97,8 +97,18 @@ time stepping (`SimParams` + `n_steps`), and what to record (`Output`).
 `simulate` writes one HDF5 file per trajectory, snapshotting every
 `write_every` steps. Stepping in chunks is exact: a chunked run reproduces one
 continuous run step-for-step on the same RNG stream, so `write_every` never
-perturbs the trajectory. `run_ensemble` and `shear_viscosity` are the
-reduce-only drivers for when you want averaged scalars and no per-step output.
+perturbs the trajectory. `run_ensemble` is the other entry point: it reduces each
+trajectory with a function you supply, so an ensemble average is
+
+```python
+Rs = bdsim.run_ensemble(phys, sim, 200, bdsim.final_state, backend="processes")
+mean, err = bdsim.mean_stderr([bdsim.radius_of_gyration_sq(R) for R in Rs])
+```
+
+and anything else you want per trajectory is a function you write. Rheological
+measurements (stress, viscosity, variance reduction) are in `bdsim.rheology`,
+deliberately not in the core run layer. A trajectory the integrator gives up on
+is dropped and reported rather than taking the run down with it.
 
 ## Documentation
 
@@ -139,14 +149,15 @@ src/            C++ core
 bindings/       nanobind module
 python/bdsim/   Python driver
   flows, initial, properties     kappa tensors, start configurations, observables
-  ensemble, parallel, storage    the run layer, HDF5 I/O, post-processing
+  ensemble, parallel, storage    simulate + run_ensemble, HDF5 I/O, post-processing
+  rheology                       stress, viscosity, variance reduction
   coarse_grain                   WLC -> FENE-Fraenkel parameters for DNA
   dynamics                       hydrodynamic radius, unit systems, relaxation times
   statistics                     autocorrelation, blocking, steady-state error bars
 tests/          one self-contained executable per unit, run by ctest
 examples/       demo.py, all_options.py
 validation/     Fortran comparison, physics checks, coarse-graining and
-                dynamics validation, viscosity sweeps
+                dynamics validation, viscosity sweeps (free-draining and HI)
 docs/           Sphinx documentation + theory.tex
 fortran/        the original SingleChainBD physics (LAPACK only) + oracle driver
 bench/          integrator timings

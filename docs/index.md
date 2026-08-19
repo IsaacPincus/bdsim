@@ -51,6 +51,6 @@ phys.flow = bdsim.flows.shear(1.0)
 sim = bdsim.SimParams()
 sim.time_end, sim.dt = 10.0, 0.01
 
-res = bdsim.run_ensemble(phys, sim, n_traj=200, backend="processes")
-print(res["Rsq"])        # (mean, standard error)
+Rs = bdsim.run_ensemble(phys, sim, 200, bdsim.final_state, backend="processes")
+print(bdsim.mean_stderr([bdsim.end_to_end_sq(R) for R in Rs]))   # (mean, stderr)
 ```

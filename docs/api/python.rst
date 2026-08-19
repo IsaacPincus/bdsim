@@ -32,6 +32,10 @@ Analysis
 .. automodule:: bdsim.properties
    :members:
 
+.. automodule:: bdsim.rheology
+   :members:
+   :undoc-members:
+
 .. automodule:: bdsim.statistics
    :members:
    :member-order: bysource

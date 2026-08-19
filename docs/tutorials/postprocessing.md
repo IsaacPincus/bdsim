@@ -48,7 +48,7 @@ is wrong by $\sqrt{g}$ throughout.
 ## The recommended path
 
 ```python
-series = bdsim.shear_viscosity_series(phys, sim, rate, n_traj, sample_times,
+series = bdsim.rheology.shear_viscosity_series(phys, sim, rate, n_traj, sample_times,
                                       initial=init, backend="processes")
 interval = sample_times[1] - sample_times[0]
 stats, se_between = bdsim.trajectory_ensemble_stats(series, interval)
@@ -97,7 +97,7 @@ Pair each trajectory with an equilibrium one on the *same random stream* and
 subtract:
 
 ```python
-series = bdsim.shear_viscosity_series(..., variance_reduction=True)
+series = bdsim.rheology.shear_viscosity_series(..., variance_reduction=True)
 ```
 
 Unbiased, because $\langle\tau_{xy}\rangle_\mathrm{eq}=0$ identically. Measured
@@ -113,7 +113,8 @@ the pair and it merely adds noise.
 ### Green--Kubo
 
 ```python
-ser = bdsim.stress_series(phys_eq, sim, n_traj, sample_times, initial=init)
+ser = bdsim.rheology.equilibrium_stress_series(phys_eq, sim, n_traj,
+                                               sample_times, initial=init)
 res = bdsim.green_kubo(ser, sample_interval)
 ```
 

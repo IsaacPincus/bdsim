@@ -1,14 +1,14 @@
 """Running trajectories and ensembles -- the single place that decides *what runs*.
 
-Three layers, smallest to largest:
+There are exactly two entry points, because an ensemble is only ever one of two
+things: something you want on disk, or something you want reduced to numbers.
 
-  * `_iter_snapshots`  -- integrate ONE chain for `n_steps` steps, yielding a
-                          snapshot every `write_every` steps (this is the exact
-                          per-step stepping used for output).
-  * `simulate`         -- run an ensemble of independent chains and write each
-                          one's snapshots (positions, optionally forces) to HDF5.
-  * `run_ensemble` /   -- run an ensemble and reduce it to averaged scalar
-    `shear_viscosity`     properties (no per-step output).
+  * `simulate`      -- run independent chains and write each one's snapshots
+                       (positions, optionally forces) to HDF5.
+  * `run_ensemble`  -- run independent chains and reduce each with a function
+                       you supply. Everything else -- equilibrium averages,
+                       stress, viscosity, tumbling statistics -- is that
+                       function. The rheological ones live in `bdsim.rheology`.
 
 A run is specified by four things, matching the natural questions a user asks:
 
@@ -19,6 +19,8 @@ A run is specified by four things, matching the natural questions a user asks:
 
 Trajectories are independent and seeded by index (seed + i), so results do not
 depend on the number of workers. Parallelism is `parallel` (serial / processes).
+A trajectory that fails is dropped and reported rather than taking the run down
+with it; see `MAX_FAILED_FRACTION`.
 """
 import os
 import sys
@@ -26,12 +28,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-import copy
-
-from ._bdsim import PhysParams, SimParams, Rng, Flow, integrate, total_force
+from ._bdsim import PhysParams, SimParams, Rng, integrate, total_force
 from .initial import (gaussian_chain, fene_fraenkel_chain,
                       fene_fraenkel_chain_aligned_x, fene_fraenkel_bending_chain)
-from . import properties as props
 from . import storage
 from .parallel import parallel_map
 
@@ -220,90 +219,13 @@ def simulate(phys: PhysParams, sim: SimParams, *, n_traj: int = 1, seed: int = 0
 
 
 # --------------------------------------------------------------------------
-# Reduced-property ensembles (no per-step output)
+# Reducing an ensemble to numbers (no per-step output)
+#
+# One primitive, run_ensemble, which maps a function of your choosing over the
+# trajectories. There is deliberately no registry of named properties and no
+# built-in "shear viscosity" entry point: a property is just a function you
+# write, and the rheological ones live in bdsim.rheology.
 # --------------------------------------------------------------------------
-
-PROPERTY_REGISTRY = {
-    "Rsq": props.end_to_end_sq,
-    "Rg_sq": props.radius_of_gyration_sq,
-}
-
-
-def _ensemble_worker(job):
-    phys, sim, seed, prop_names, method, kwargs = job
-    R0 = INITIALIZERS[method](phys.number_of_beads, seed, kwargs)
-    R = integrate(R0, phys, sim, Rng(seed))
-    return [float(PROPERTY_REGISTRY[name](R)) for name in prop_names]
-
-
-def _viscosity_worker(job):
-    """Per-sample viscosity contributions for one trajectory (not their mean).
-
-    The series is returned rather than averaged so that the caller can estimate
-    the error properly: successive samples are correlated, so their scatter
-    understates the uncertainty unless the autocorrelation is accounted for
-    (see `bdsim.statistics`).
-
-    With `variance_reduction`, a second chain is propagated at equilibrium from the
-    same initial configuration and driven by the SAME random stream, and its shear
-    stress is subtracted sample by sample:
-
-        eta_p = -<tau_xy - tau_xy^eq> / gammadot .
-
-    This is unbiased, because <tau_xy^eq> = 0 identically by symmetry, but the two
-    chains see the same Brownian kicks and so fluctuate together and most of the
-    noise cancels in the difference.
-
-    The two chains stay in lockstep because the integrator draws exactly 3N
-    deviates per step regardless of configuration, and nothing else consumes the
-    stream (the implicit solve and the Chebyshev series are both deterministic).
-
-    WHEN TO USE IT. The benefit depends entirely on how correlated the pair stays,
-    and shear destroys that correlation: the flow rotates and eventually tumbles
-    the chain, and the sheared and unsheared copies fall out of phase. Measured
-    variance ratios (2 kbp, Ns = 20, free draining), where >2 is needed just to pay
-    for the doubled cost:
-
-        Wi = 0.01   146x        Wi = 0.3    1.2x
-        Wi = 0.03    31x        Wi = 3      0.6x  (worse than not using it)
-
-    So this is a low-shear tool. Below Wi ~ 0.1 it makes the near-equilibrium
-    region accessible at all -- a direct measurement there returns noise, because
-    the signal falls off as Wi while the stress fluctuations do not. Above Wi ~ 0.3
-    it adds independent noise and should be left off.
-
-    Being unbiased, it agrees with the direct estimate where both work: at Wi = 3,
-    224 +/- 147 against 332 +/- 159 (0.50 sigma); at Wi = 0.3, 3883 +/- 1259
-    against 2951 +/- 923.
-
-    Note that even 146x is not a licence to push arbitrarily low. The signal itself
-    scales as Wi, so the sampling needed still grows as Wi -> 0; at Wi = 0.01 the
-    residual noise remains larger than the answer for the run lengths used here.
-    """
-    phys, sim, rate, sample_times, seed, method, kwargs, vr = job
-    R0 = INITIALIZERS[method](phys.number_of_beads, seed, kwargs)
-
-    if not vr:
-        rng = Rng(seed)
-        return [-float(props.kramers_stress(R, total_force(R, phys))[0, 1]) / rate
-                for _t, R in trajectory_samples(R0, phys, sim, rng, sample_times)]
-
-    phys_eq = copy.deepcopy(phys)
-    phys_eq.flow = Flow()                      # zero velocity gradient
-    R_f = np.asarray(R0, dtype=np.float64)
-    R_e = R_f.copy()
-    rng_f, rng_e = Rng(seed), Rng(seed)         # identical streams
-    out, t = [], sim.time_start
-    for ts in sample_times:
-        seg = _segment(sim, t, ts)
-        R_f = integrate(R_f, phys, seg, rng_f)
-        R_e = integrate(R_e, phys_eq, seg, rng_e)
-        tau_f = props.kramers_stress(R_f, total_force(R_f, phys))[0, 1]
-        tau_e = props.kramers_stress(R_e, total_force(R_e, phys))[0, 1]
-        out.append(-float(tau_f - tau_e) / rate)
-        t = ts
-    return out
-
 
 MAX_FAILED_FRACTION = 0.1
 """Above this share of failed trajectories an ensemble refuses to return a value.
@@ -362,111 +284,96 @@ def _drop_failures(results, what, max_fraction=None):
     return ok, bad
 
 
-def _stats(values, n):
+def mean_stderr(values):
+    """(mean, standard error of the mean) of a 1-D sequence.
+
+    The plain estimate, valid when the values are independent -- one number per
+    trajectory, say. It is NOT valid for successive samples along one trajectory,
+    which are correlated; use `bdsim.statistics.trajectory_ensemble_stats` for
+    those.
+    """
     arr = np.asarray(values, dtype=float)
+    n = arr.size
     mean = float(arr.mean())
     stderr = float(arr.std(ddof=1) / np.sqrt(n)) if n > 1 else float("nan")
     return mean, stderr
 
 
-def run_ensemble(phys: PhysParams, sim: SimParams, n_traj: int, *, seed: int = 0,
-                 n_beads: int = None, properties=("Rsq", "Rg_sq"),
+def _run_worker(job):
+    """Build this trajectory's starting chain and hand it to the user function."""
+    fn, phys, sim, seed, method, kwargs, args = job
+    R0 = INITIALIZERS[method](phys.number_of_beads, seed, kwargs)
+    return fn(R0, phys, sim, Rng(seed), *args)
+
+
+def final_state(R0, phys, sim, rng):
+    """A `per_trajectory` function: integrate the chain and return its final (N,3).
+
+    The simplest useful one, and the building block for equilibrium averages:
+
+        Rs = run_ensemble(phys, sim, 200, final_state)
+        rg2 = [radius_of_gyration_sq(R) for R in Rs]
+        mean, err = mean_stderr(rg2)
+    """
+    return np.asarray(integrate(R0, phys, sim, rng), dtype=np.float64)
+
+
+def sampled_states(R0, phys, sim, rng, sample_times):
+    """A `per_trajectory` function: the configuration at each of `sample_times`.
+
+    Returns a list of (N,3) arrays. `run_ensemble(..., args=(times,))` passes the
+    times through.
+    """
+    return [R for _t, R in trajectory_samples(R0, phys, sim, rng, sample_times)]
+
+
+def run_ensemble(phys: PhysParams, sim: SimParams, n_traj: int,
+                 per_trajectory, *, args=(), seed: int = 0,
                  initial: Initial = None, backend="serial", n_workers=None,
                  on_error="skip", max_failed_fraction=None):
-    """Run `n_traj` chains and average the named properties.
+    """Run `n_traj` independent chains, reducing each one with your own function.
+
+    This is the whole ensemble layer. `per_trajectory` is called once per chain as
+
+        per_trajectory(R0, phys, sim, rng, *args)
+
+    with `R0` the starting configuration built from `initial` and `rng` already
+    seeded with `seed + i`, and may return anything: a number, an array, a tuple.
+    Results come back as a list in trajectory order, with failed trajectories
+    dropped and reported (see MAX_FAILED_FRACTION).
+
+    Because trajectories are seeded by index, the result does not depend on how
+    many workers ran it.
+
+    One constraint with `backend="processes"`: `per_trajectory` is sent to the
+    worker processes by pickle, so it must be a module-level function --- a
+    lambda, a closure, or a function defined inside another function will not
+    pickle. Anything that varies between runs goes in `args`.
 
     `initial` is an `Initial` (default: gaussian). Starting from a configuration
     already drawn from the model's equilibrium matters whenever the springs are
-    stiff or have a large natural length -- a gaussian start is then so far from
+    stiff or have a large natural length: a gaussian start is then so far from
     equilibrium that a short run measures the relaxation, not the equilibrium.
-    Returns {name: (mean, stderr)}. `properties` are keys of PROPERTY_REGISTRY.
-    """
-    if n_beads:
-        phys.number_of_beads = n_beads
-    initial = initial or Initial()
-    names = list(properties)
-    jobs = [(phys, sim, seed + i, names, initial.method, dict(initial.kwargs))
-            for i in range(n_traj)]
-    vals = parallel_map(_ensemble_worker, jobs, backend=backend,
-                        n_workers=n_workers, on_error=on_error)
-    vals, _ = _drop_failures(vals, "trajectories", max_failed_fraction)
-    arr = np.array(vals)  # (n_ok, n_props)
-    n_ok = len(vals)
-    return {name: _stats(arr[:, k], n_ok) for k, name in enumerate(names)}
 
+    Examples
+    --------
+    Equilibrium averages::
 
-def shear_viscosity(phys: PhysParams, sim: SimParams, rate: float, n_traj: int,
-                    sample_times, *, seed: int = 0, n_beads: int = None,
-                    initial: Initial = None, variance_reduction: bool = False,
-                    backend="serial", n_workers=None,
-                    on_error="skip", max_failed_fraction=None):
-    """Steady-state polymer shear viscosity -<tau_xy>/rate over samples and
-    trajectories. `phys.flow` must be a shear flow at `rate`. Returns (mean, stderr).
-    """
-    if n_beads:
-        phys.number_of_beads = n_beads
-    initial = initial or Initial()
-    st = list(sample_times)
-    jobs = [(phys, sim, rate, st, seed + i, initial.method, dict(initial.kwargs),
-             variance_reduction) for i in range(n_traj)]
-    series = parallel_map(_viscosity_worker, jobs, backend=backend,
-                          n_workers=n_workers, on_error=on_error)
-    series, _ = _drop_failures(series, "trajectories", max_failed_fraction)
-    return _stats([float(np.mean(s)) for s in series], len(series))
+        Rs = run_ensemble(phys, sim, 200, final_state, backend="processes")
+        mean, err = mean_stderr([radius_of_gyration_sq(R) for R in Rs])
 
+    Anything else you want per trajectory is a function you write::
 
-def _stress_series_worker(job):
-    """Equilibrium shear-stress time series for one trajectory (Green-Kubo input)."""
-    phys, sim, sample_times, seed, method, kwargs = job
-    R0 = INITIALIZERS[method](phys.number_of_beads, seed, kwargs)
-    rng = Rng(seed)
-    return [float(props.kramers_stress(R, total_force(R, phys))[0, 1])
-            for _t, R in trajectory_samples(R0, phys, sim, rng, sample_times)]
+        def max_extension(R0, phys, sim, rng):
+            R = integrate(R0, phys, sim, rng)
+            return float(np.ptp(R[:, 0]))
 
-
-def stress_series(phys: PhysParams, sim: SimParams, n_traj: int, sample_times, *,
-                  seed: int = 0, initial: Initial = None, backend="serial",
-                  n_workers=None, on_error="skip", max_failed_fraction=None):
-    """Equilibrium tau_xy(t) for `n_traj` chains, as an (n_traj, n_samples) array.
-
-    `phys.flow` should be the zero tensor: Green-Kubo extracts the zero-shear
-    viscosity from equilibrium fluctuations, with no flow applied. Feed the result
-    to `bdsim.statistics.green_kubo`.
+        vals = run_ensemble(phys, sim, 200, max_extension)
     """
     initial = initial or Initial()
-    st = list(sample_times)
-    jobs = [(phys, sim, st, seed + i, initial.method, dict(initial.kwargs))
-            for i in range(n_traj)]
-    out = parallel_map(_stress_series_worker, jobs, backend=backend,
-                       n_workers=n_workers, on_error=on_error)
+    jobs = [(per_trajectory, phys, sim, seed + i, initial.method,
+             dict(initial.kwargs), tuple(args)) for i in range(n_traj)]
+    out = parallel_map(_run_worker, jobs, backend=backend, n_workers=n_workers,
+                       on_error=on_error)
     out, _ = _drop_failures(out, "trajectories", max_failed_fraction)
-    return np.asarray(out)
-
-
-def shear_viscosity_series(phys: PhysParams, sim: SimParams, rate: float, n_traj: int,
-                           sample_times, *, seed: int = 0, n_beads: int = None,
-                           initial: Initial = None, variance_reduction: bool = False,
-                           backend="serial", n_workers=None,
-                           on_error="skip", max_failed_fraction=None):
-    """As `shear_viscosity`, but returns the raw (n_traj, n_samples) array of
-    per-sample viscosity contributions.
-
-    Use this when you want honest error bars: feed it to
-    `bdsim.statistics.trajectory_ensemble_stats`, which corrects for the
-    correlation between successive samples within each trajectory and
-    cross-checks against the scatter between trajectories.
-
-    `variance_reduction` pairs each trajectory with an equilibrium one on the same
-    random stream and subtracts its stress; see `_viscosity_worker`. Unbiased, and
-    far more precise at low shear rate, at twice the cost.
-    """
-    if n_beads:
-        phys.number_of_beads = n_beads
-    initial = initial or Initial()
-    st = list(sample_times)
-    jobs = [(phys, sim, rate, st, seed + i, initial.method, dict(initial.kwargs),
-             variance_reduction) for i in range(n_traj)]
-    out = parallel_map(_viscosity_worker, jobs, backend=backend,
-                       n_workers=n_workers, on_error=on_error)
-    out, _ = _drop_failures(out, "trajectories", max_failed_fraction)
-    return np.asarray(out)
+    return out
